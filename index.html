@@ -287,10 +287,24 @@
       });
     });
   }
+  function patchVersion() {
+    // Atualiza qualquer texto de versão encontrado no DOM (ex: "v2.x.x", "Version 2.x.x", "2.x.x")
+    const VERSION = "2.1.0";
+    document.querySelectorAll("*").forEach((node) => {
+      if (node.children.length > 0) return; // só folhas de texto
+      const t = node.textContent || "";
+      if (/\bv?\d+\.\d+\.\d+\b/.test(t) && t.length < 40) {
+        const updated = t.replace(/\bv?\d+\.\d+\.\d+\b/, "v" + VERSION);
+        if (updated !== t) node.textContent = updated;
+      }
+    });
+  }
+
   function watchAboutTutorial() {
     mountAboutTutorial();
     cleanOptionsSyncPanel();
-    const observer = new MutationObserver(() => { mountAboutTutorial(); cleanOptionsSyncPanel(); });
+    patchVersion();
+    const observer = new MutationObserver(() => { mountAboutTutorial(); cleanOptionsSyncPanel(); patchVersion(); });
     observer.observe(document.body, { childList: true, subtree: true });
   }
   const style = document.createElement("style");
