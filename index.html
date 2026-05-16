@@ -287,24 +287,10 @@
       });
     });
   }
-  function patchVersion() {
-    // Atualiza qualquer texto de versão encontrado no DOM (ex: "v2.x.x", "Version 2.x.x", "2.x.x")
-    const VERSION = "2.1.0";
-    document.querySelectorAll("*").forEach((node) => {
-      if (node.children.length > 0) return; // só folhas de texto
-      const t = node.textContent || "";
-      if (/\bv?\d+\.\d+\.\d+\b/.test(t) && t.length < 40) {
-        const updated = t.replace(/\bv?\d+\.\d+\.\d+\b/, "v" + VERSION);
-        if (updated !== t) node.textContent = updated;
-      }
-    });
-  }
-
   function watchAboutTutorial() {
     mountAboutTutorial();
     cleanOptionsSyncPanel();
-    patchVersion();
-    const observer = new MutationObserver(() => { mountAboutTutorial(); cleanOptionsSyncPanel(); patchVersion(); });
+    const observer = new MutationObserver(() => { mountAboutTutorial(); cleanOptionsSyncPanel(); });
     observer.observe(document.body, { childList: true, subtree: true });
   }
   const style = document.createElement("style");
@@ -539,155 +525,126 @@ select.form-input { cursor: pointer; }
 
 </script>
   <script>
+/* ── Nexo 2.0 — Mobile Header ───────────────────────────────────────────── */
 (function () {
   'use strict';
 
-  // ── Estilos do header móvel ──────────────────────────────────────────────
-  var style = document.createElement('style');
-  style.textContent =
-    /* ── Header fixo laranja ── */
-    '#nexo-mobile-header{display:none;position:fixed;top:0;left:0;right:0;height:56px;' +
-    'background:var(--accent,#E07A5F);z-index:1000;flex-direction:row;align-items:center;' +
-    'padding:0 8px 0 4px;box-shadow:0 2px 10px rgba(0,0,0,.18);}' +
+  /* CSS injetado dinamicamente */
+  var s = document.createElement('style');
+  s.textContent =
+    /* Header fixo laranja */
+    '#nm-header{display:none;position:fixed;top:0;left:0;right:0;height:56px;' +
+    'background:var(--accent,#E07A5F);z-index:1000;align-items:center;' +
+    'flex-direction:row;padding:0 8px 0 4px;' +
+    'box-shadow:0 2px 10px rgba(0,0,0,.18);}' +
 
-    '#nexo-mobile-header .mhdr-menu-btn{background:none;border:none;cursor:pointer;' +
-    'color:#fff;padding:10px;display:flex;align-items:center;justify-content:center;' +
-    'border-radius:8px;transition:background 0.15s;}' +
-    '#nexo-mobile-header .mhdr-menu-btn:active{background:rgba(255,255,255,.15);}' +
+    '#nm-header .nm-menu{background:none;border:none;cursor:pointer;color:#fff;' +
+    'padding:10px;display:flex;align-items:center;border-radius:8px;' +
+    'transition:background .15s;}' +
+    '#nm-header .nm-menu:active{background:rgba(255,255,255,.15);}' +
 
-    '#nexo-mobile-header .mhdr-title{flex:1;font-family:"Fraunces",serif;font-size:21px;' +
-    'font-weight:700;color:#fff;letter-spacing:-0.4px;padding-left:4px;}' +
+    '#nm-header .nm-title{flex:1;font-family:"Fraunces",serif;font-size:21px;' +
+    'font-weight:700;color:#fff;letter-spacing:-.4px;padding-left:4px;}' +
 
-    '#nexo-mobile-header .mhdr-page{font-size:12px;color:rgba(255,255,255,.82);' +
-    'font-weight:400;font-family:"DM Sans",sans-serif;padding-right:6px;max-width:120px;' +
-    'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
+    '#nm-header .nm-page{font-size:12px;color:rgba(255,255,255,.82);' +
+    'font-family:"DM Sans",sans-serif;padding-right:8px;' +
+    'max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
 
-    /* ── Drawer (dropdown de tabs) ── */
-    '#nexo-mobile-drawer{display:none;position:fixed;top:56px;left:0;right:0;' +
+    /* Drawer */
+    '#nm-drawer{display:none;position:fixed;top:56px;left:0;right:0;' +
     'background:var(--surface,#fff);border-bottom:1px solid var(--border,#e5e7eb);' +
-    'box-shadow:0 8px 28px rgba(0,0,0,.13);z-index:999;flex-direction:column;padding:6px 0;}' +
-    '#nexo-mobile-drawer.open{display:flex;}' +
+    'box-shadow:0 8px 28px rgba(0,0,0,.13);z-index:999;' +
+    'flex-direction:column;padding:6px 0;}' +
+    '#nm-drawer.open{display:flex;}' +
 
-    '#nexo-mobile-drawer .mdrawer-btn{display:flex;align-items:center;gap:13px;' +
-    'padding:14px 20px;background:none;border:none;cursor:pointer;font-size:15px;' +
-    'font-weight:500;color:var(--text,#1f2937);font-family:inherit;text-align:left;' +
-    'transition:background 0.12s;width:100%;}' +
-    '#nexo-mobile-drawer .mdrawer-btn:active{background:var(--surface-hover,#f9fafb);}' +
-    '#nexo-mobile-drawer .mdrawer-btn.active{color:var(--accent,#E07A5F);' +
+    '#nm-drawer .nm-item{display:flex;align-items:center;gap:13px;' +
+    'padding:14px 20px;background:none;border:none;cursor:pointer;' +
+    'font-size:15px;font-weight:500;color:var(--text,#1f2937);' +
+    'font-family:inherit;width:100%;text-align:left;transition:background .12s;}' +
+    '#nm-drawer .nm-item:active{background:var(--surface-hover,#f9fafb);}' +
+    '#nm-drawer .nm-item.active{color:var(--accent,#E07A5F);' +
     'background:var(--accent-light,#fdf0ed);}' +
-    '#nexo-mobile-drawer .mdrawer-btn svg{width:20px;height:20px;flex-shrink:0;}' +
+    '#nm-drawer .nm-item svg{width:20px;height:20px;flex-shrink:0;}' +
 
-    /* ── Overlay escuro atrás do drawer ── */
-    '#nexo-mobile-overlay{display:none;position:fixed;inset:56px 0 0 0;' +
+    /* Overlay */
+    '#nm-overlay{display:none;position:fixed;inset:56px 0 0 0;' +
     'background:rgba(0,0,0,.25);z-index:998;}' +
-    '#nexo-mobile-overlay.open{display:block;}' +
+    '#nm-overlay.open{display:block;}' +
 
-    '@media(max-width:900px){#nexo-mobile-header{display:flex;}}';
-  document.head.appendChild(style);
+    /* Só aparece em mobile */
+    '@media(max-width:900px){#nm-header{display:flex;}}';
+  document.head.appendChild(s);
 
-  // ── Cria elementos ────────────────────────────────────────────────────────
+  /* Elementos */
   var header = document.createElement('header');
-  header.id = 'nexo-mobile-header';
+  header.id = 'nm-header';
   header.innerHTML =
-    '<button class="mhdr-menu-btn" id="mhdr-menu-btn" aria-label="Menu">' +
+    '<button class="nm-menu" id="nm-menu-btn" aria-label="Menu">' +
       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">' +
-        '<line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>' +
+        '<line x1="3" y1="6" x2="21" y2="6"/>' +
+        '<line x1="3" y1="12" x2="21" y2="12"/>' +
+        '<line x1="3" y1="18" x2="21" y2="18"/>' +
       '</svg>' +
     '</button>' +
-    '<span class="mhdr-title">Nexo</span>' +
-    '<span class="mhdr-page" id="mhdr-page"></span>';
+    '<span class="nm-title">Nexo</span>' +
+    '<span class="nm-page" id="nm-page-label"></span>';
 
-  var drawer = document.createElement('div');
-  drawer.id = 'nexo-mobile-drawer';
-
-  var overlay = document.createElement('div');
-  overlay.id = 'nexo-mobile-overlay';
+  var drawer  = document.createElement('div'); drawer.id  = 'nm-drawer';
+  var overlay = document.createElement('div'); overlay.id = 'nm-overlay';
 
   document.body.appendChild(header);
   document.body.appendChild(drawer);
   document.body.appendChild(overlay);
 
-  // ── Abrir / fechar drawer ─────────────────────────────────────────────────
-  var menuBtn = document.getElementById('mhdr-menu-btn');
-  function closeDrawer() {
-    drawer.classList.remove('open');
-    overlay.classList.remove('open');
-  }
-  function toggleDrawer() {
-    var isOpen = drawer.classList.toggle('open');
-    overlay.classList.toggle('open', isOpen);
-  }
-  menuBtn.addEventListener('click', function (e) { e.stopPropagation(); toggleDrawer(); });
-  overlay.addEventListener('click', closeDrawer);
+  /* Abrir / fechar */
+  function close() { drawer.classList.remove('open'); overlay.classList.remove('open'); }
+  function toggle() { var o = drawer.classList.toggle('open'); overlay.classList.toggle('open', o); }
+  document.getElementById('nm-menu-btn').addEventListener('click', function(e){ e.stopPropagation(); toggle(); });
+  overlay.addEventListener('click', close);
 
-  // ── Atualiza label da página ativa no header ──────────────────────────────
-  function updatePageLabel() {
+  /* Label da página ativa no header */
+  function updateLabel() {
     var active = document.querySelector('.sidebar button.nav-item.active');
     if (!active) return;
-    var label = '';
-    active.childNodes.forEach(function (n) {
-      if (n.nodeType === Node.TEXT_NODE) label += n.textContent.trim();
-    });
-    var el = document.getElementById('mhdr-page');
-    if (el && label) el.textContent = label;
+    var lbl = '';
+    active.childNodes.forEach(function(n){ if (n.nodeType === 3) lbl += n.textContent.trim(); });
+    var el = document.getElementById('nm-page-label');
+    if (el && lbl) el.textContent = lbl;
   }
 
-  // ── Constrói o drawer com os itens da sidebar ─────────────────────────────
-  function buildDrawer() {
-    var sidebarBtns = document.querySelectorAll('.sidebar button.nav-item');
-    if (!sidebarBtns.length) return false;
+  /* Constrói os itens do drawer a partir da sidebar */
+  function build() {
+    var btns = document.querySelectorAll('.sidebar button.nav-item');
+    if (!btns.length) return false;
 
-    var existing = drawer.querySelectorAll('.mdrawer-btn');
-    if (existing.length === sidebarBtns.length) {
-      sidebarBtns.forEach(function (sb, i) {
-        if (existing[i]) existing[i].classList.toggle('active', sb.classList.contains('active'));
-      });
-      updatePageLabel();
+    var cur = drawer.querySelectorAll('.nm-item');
+    if (cur.length === btns.length) {
+      btns.forEach(function(b, i){ if(cur[i]) cur[i].classList.toggle('active', b.classList.contains('active')); });
+      updateLabel();
       return true;
     }
 
     drawer.innerHTML = '';
-    sidebarBtns.forEach(function (sb) {
+    btns.forEach(function(sb) {
       var btn = document.createElement('button');
-      btn.className = 'mdrawer-btn' + (sb.classList.contains('active') ? ' active' : '');
-
-      var svgEl = sb.querySelector('svg');
-      var svg = svgEl ? svgEl.outerHTML : '';
-      var label = '';
-      sb.childNodes.forEach(function (n) {
-        if (n.nodeType === Node.TEXT_NODE) label += n.textContent.trim();
-      });
-
-      btn.innerHTML = svg + (label ? '<span>' + label + '</span>' : '');
-
-      (function (source) {
-        btn.addEventListener('click', function () {
-          source.click();
-          closeDrawer();
-        });
-      })(sb);
-
+      btn.className = 'nm-item' + (sb.classList.contains('active') ? ' active' : '');
+      var svg = sb.querySelector('svg'); svg = svg ? svg.outerHTML : '';
+      var lbl = '';
+      sb.childNodes.forEach(function(n){ if (n.nodeType === 3) lbl += n.textContent.trim(); });
+      btn.innerHTML = svg + (lbl ? '<span>' + lbl + '</span>' : '');
+      (function(src){ btn.addEventListener('click', function(){ src.click(); close(); }); })(sb);
       drawer.appendChild(btn);
     });
-
-    updatePageLabel();
+    updateLabel();
     return true;
   }
 
-  // ── Poll até o React renderizar ───────────────────────────────────────────
-  var tries = 0;
-  var poll = setInterval(function () {
-    tries++;
-    if (buildDrawer() || tries > 50) clearInterval(poll);
-  }, 200);
+  /* Aguarda React renderizar */
+  var t = 0, iv = setInterval(function(){ if(build() || ++t > 50) clearInterval(iv); }, 200);
 
-  // ── Observa mudanças para manter active sincronizado ─────────────────────
-  var mo = new MutationObserver(function () {
-    buildDrawer();
-  });
-  mo.observe(document.body, {
-    childList: true, subtree: true,
-    attributes: true, attributeFilter: ['class']
+  /* Mantém active sincronizado */
+  new MutationObserver(build).observe(document.body, {
+    childList: true, subtree: true, attributes: true, attributeFilter: ['class']
   });
 })();
   </script>
