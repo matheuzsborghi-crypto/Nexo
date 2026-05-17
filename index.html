@@ -525,6 +525,2230 @@ select.form-input { cursor: pointer; }
 
 </script>
   <script>
+/* ── Nexo — Investments Dashboard Redesign ──────────────────────────────── */
+(function () {
+  'use strict';
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
+  const ASSETS_KEY = 'nexo_investment_assets';
+  const TXS_KEY    = 'nexo_investment_transactions';
+  const FIXED_INCOME = new Set(['CDB','LCI','LCA','Fund']);
+
+  function loadAssets()  { try { return JSON.parse(localStorage.getItem(ASSETS_KEY) || '[]'); } catch { return []; } }
+  function loadTxs()     { try { return JSON.parse(localStorage.getItem(TXS_KEY) || '[]'); } catch { return []; } }
+
+  // Carrega dados frescos do Gist para o localStorage antes de renderizar
+  async function loadFromGist() {
+    try {
+      const resp = await fetch('/api/sync/data');
+      if (!resp.ok) return;
+      const json = await resp.json();
+      const d = json && json.payload && json.payload.data;
+      if (!d) return;
+      if (Array.isArray(d.investmentAssets))
+        localStorage.setItem(ASSETS_KEY, JSON.stringify(d.investmentAssets));
+      if (Array.isArray(d.investmentTransactions))
+        localStorage.setItem(TXS_KEY, JSON.stringify(d.investmentTransactions));
+    } catch (e) {
+      console.warn('[Nexo Dash] loadFromGist failed:', e);
+    }
+  }
+
+  function fmtBRL(v, d) {
+    if (v == null || isNaN(v)) return 'R$ —';
+    const opts = { minimumFractionDigits: d ?? 2, maximumFractionDigits: d ?? 2 };
+    return 'R$ ' + Math.abs(v).toLocaleString('pt-BR', opts);
+  }
+  function fmtPct(v) {
+    if (v == null || isNaN(v)) return '—';
+    return (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+  }
+  function fmtK(v) {
+    if (Math.abs(v) >= 1e6) return 'R$ ' + (v/1e6).toFixed(1) + 'M';
+    if (Math.abs(v) >= 1e3) return 'R$ ' + (v/1e3).toFixed(1) + 'k';
+    return 'R$ ' + v.toFixed(0);
+  }
+  function fmtDate(str) {
+    if (!str) return '—';
+    const [y,m,d] = str.split('-');
+    return d+'/'+m+'/'+y;
+  }
+  function today() {
+    const n = new Date();
+    return n.toISOString().slice(0,10);
+  }
+
+  // ── Class colours ─────────────────────────────────────────────────────────
+  const CLASS_COLORS = {
+    'ETF':   'var(--accent, #E07A5F)',
+    'CDB':   '#B58A3B',
+    'LCI':   '#6B9E7A',
+    'LCA':   '#5C8A6C',
+    'Fund':  '#4C7A99',
+    'Cash':  '#7A756F',
+  };
+  function classColor(cls) { return CLASS_COLORS[cls] || '#7A756F'; }
+
+  // ── XIRR ─────────────────────────────────────────────────────────────────
+  function computeXIRR(cashflows) {
+    if (!cashflows || cashflows.length < 2) return null;
+    const t0 = new Date(cashflows[0].date).getTime();
+    function npv(r) {
+      return cashflows.reduce((s, cf) => {
+        const t = new Date(cf.date).getTime();
+        const years = (t - t0) / (365.25 * 24 * 3600 * 1000);
+        return s + cf.amount / Math.pow(1 + r, years);
+      }, 0);
+    }
+    let lo = -0.999, hi = 100, mid = 0;
+    for (let i = 0; i < 200; i++) {
+      mid = (lo + hi) / 2;
+      if (npv(mid) > 0) lo = mid; else hi = mid;
+      if (hi - lo < 1e-8) break;
+    }
+    return isFinite(mid) ? mid : null;
+  }
+
+  // ── Portfolio calculations ────────────────────────────────────────────────
+  function calcPortfolio() {
+    const assets = loadAssets();
+    const txs    = loadTxs();
+
+    const result = assets.map(asset => {
+      const myTxs = txs.filter(t => t.assetId === asset.id);
+      const fi = FIXED_INCOME.has(asset.assetClass);
+
+      let qtyNet = 0, firstBuyDate = null;
+      let totalBuyQty = 0, weightedBuyCost = 0;
+      let totalBuyAmt = 0, totalSellAmt = 0; // para fundos/renda fixa
+
+      myTxs.forEach(t => {
+        const d = t.date;
+        if (t.type === 'buy' || t.type === 'adjustment') {
+          const qty = parseFloat(t.quantity) || 1;
+          const amt = parseFloat(t.amount)   || 0;
+          qtyNet          += fi ? 0 : qty;   // fundos não contam qty
+          weightedBuyCost += fi ? 0 : amt * qty;
+          totalBuyQty     += fi ? 0 : qty;
+          totalBuyAmt     += fi ? amt : 0;   // fundos: soma o valor total
+          if (!firstBuyDate || d < firstBuyDate) firstBuyDate = d;
+        } else if (t.type === 'sell') {
+          const qty = parseFloat(t.quantity) || 1;
+          const amt = parseFloat(t.amount)   || 0;
+          qtyNet      -= fi ? 0 : qty;
+          totalSellAmt += fi ? amt : 0;
+        }
+      });
+
+      const manualPrice = parseFloat(asset.manualUnitPrice) || 0;
+      let avgPrice, position, pl, costBasis;
+
+      if (!fi) {
+        // ETF: preço médio ponderado por qtd de cotas
+        avgPrice  = totalBuyQty > 0 ? weightedBuyCost / totalBuyQty : 0;
+        position  = qtyNet * manualPrice;
+        pl        = (manualPrice - avgPrice) * qtyNet;
+        costBasis = avgPrice * qtyNet;
+      } else {
+        // Fundo/renda fixa: capital líquido = Σbuys − Σsells
+        const netInvested = totalBuyAmt - totalSellAmt;
+        avgPrice  = netInvested;  // usado para exibir "Capital invested" no Dashboard
+        position  = manualPrice;
+        // Para renda fixa: P/L inclui cupons/dividendos recebidos
+        const assetIncome = myTxs
+          .filter(t => t.type === 'income')
+          .reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+        pl        = (manualPrice - netInvested) + assetIncome;
+        costBasis = netInvested;
+      }
+
+      return {
+        ...asset,
+        qtyNet, avgPrice, position, pl, costBasis,
+        firstBuyDate,
+        txs: myTxs,
+        fi,
+      };
+    }).filter(a => a.position > 0 || a.qtyNet > 0);
+
+    const totalPosition = result.reduce((s, a) => s + a.position, 0);
+    result.forEach(a => { a.allocation = totalPosition > 0 ? (a.position / totalPosition) * 100 : 0; });
+
+    // Income totals
+    const allIncome = txs.filter(t => t.type === 'income');
+    const totalIncome = allIncome.reduce((s,t) => s + (parseFloat(t.amount)||0), 0);
+    const dividendCount = allIncome.filter(t => {
+      const a = assets.find(x => x.id === t.assetId);
+      return a && a.assetClass === 'Fund';
+    }).length;
+    const couponCount = allIncome.filter(t => {
+      const a = assets.find(x => x.id === t.assetId);
+      return a && a.assetClass !== 'Fund';
+    }).length;
+
+    // Total cost basis & P/L
+    const totalCostBasis = result.reduce((s,a) => s + a.costBasis, 0);
+    const totalPL        = result.reduce((s,a) => s + a.pl, 0);
+    const totalPLpct     = totalCostBasis > 0 ? (totalPL / totalCostBasis) * 100 : 0;
+
+    // XIRR cashflows
+    const allTxsSorted = txs.slice().sort((a,b)=> a.date < b.date ? -1 : 1);
+    const xirrCFs = allTxsSorted.map(t => {
+      const amt = parseFloat(t.amount) || 0;
+      const qty = parseFloat(t.quantity) || 1;
+      const a   = assets.find(x => x.id === t.assetId);
+      const fi2 = a ? FIXED_INCOME.has(a.assetClass) : false;
+      let cash;
+      if (t.type === 'buy' || t.type === 'adjustment') {
+        cash = fi2 ? -amt : -(amt * qty);
+      } else if (t.type === 'sell' || t.type === 'income') {
+        cash = fi2 ? amt : (amt * qty);
+      } else {
+        cash = 0;
+      }
+      return { date: t.date, amount: cash };
+    }).filter(c => c.amount !== 0);
+
+    if (xirrCFs.length > 0 && totalPosition > 0) {
+      xirrCFs.push({ date: today(), amount: +totalPosition });
+    }
+
+    const irr = xirrCFs.length >= 2 ? computeXIRR(xirrCFs) : null;
+    const firstTxDate = allTxsSorted.length > 0 ? allTxsSorted[0].date : null;
+
+    return {
+      assets: result,
+      totalPosition,
+      totalIncome,
+      dividendCount,
+      couponCount,
+      totalCostBasis,
+      totalPL,
+      totalPLpct,
+      irr,
+      firstTxDate,
+      allTxs: txs,
+    };
+  }
+
+  // ── State ─────────────────────────────────────────────────────────────────
+  const state = { period: 'all', allocationView: 'class' };
+
+  // ── Navigation ────────────────────────────────────────────────────────────
+  function goToInvestmentsTx() {
+    const btns = document.querySelectorAll('.sidebar button.nav-item');
+    btns.forEach(btn => {
+      let lbl = '';
+      btn.childNodes.forEach(n => { if (n.nodeType === 3) lbl += n.textContent; });
+      if (/trans/i.test(lbl) && /invest/i.test(lbl)) btn.click();
+    });
+  }
+
+  // ── Flow chart data ───────────────────────────────────────────────────────
+  function getFlowData(txs, assets, period) {
+    const now = new Date();
+    let fromDate;
+    if (period === 'month') {
+      fromDate = new Date(now.getFullYear(), now.getMonth(), 1);
+    } else if (period === '30d') {
+      fromDate = new Date(now.getTime() - 30*24*3600*1000);
+    } else if (period === 'year') {
+      fromDate = new Date(now.getFullYear(), 0, 1);
+    } else {
+      fromDate = null;
+    }
+
+    const filtered = txs.filter(t => !fromDate || t.date >= fromDate.toISOString().slice(0,10));
+
+    const months = {};
+    filtered.forEach(t => {
+      const [y,m] = t.date.split('-');
+      const key = y+'-'+m;
+      if (!months[key]) months[key] = { buy: 0, income: 0, sell: 0, adj: 0 };
+      const a   = assets.find(x => x.id === t.assetId);
+      const fi  = a ? FIXED_INCOME.has(a.assetClass) : false;
+      const amt = parseFloat(t.amount) || 0;
+      const qty = parseFloat(t.quantity) || 1;
+      const val = fi ? amt : amt * qty;
+      if (t.type === 'buy')        months[key].buy    += val;
+      else if (t.type === 'sell')  months[key].sell   += val;
+      else if (t.type === 'income')months[key].income += amt;
+      else if (t.type === 'adjustment') months[key].adj += val;
+    });
+
+    const sorted = Object.keys(months).sort();
+    const totals = { buy:0, sell:0, income:0, adj:0 };
+    filtered.forEach(t => {
+      const a   = assets.find(x => x.id === t.assetId);
+      const fi  = a ? FIXED_INCOME.has(a.assetClass) : false;
+      const amt = parseFloat(t.amount) || 0;
+      const qty = parseFloat(t.quantity) || 1;
+      const val = fi ? amt : amt * qty;
+      if (t.type === 'buy')         totals.buy    += val;
+      else if (t.type === 'sell')   totals.sell   += val;
+      else if (t.type === 'income') totals.income += amt;
+      else if (t.type === 'adjustment') totals.adj += val;
+    });
+
+    return { monthKeys: sorted, months, totals };
+  }
+
+  // ── SVG Donut ─────────────────────────────────────────────────────────────
+  function buildDonutSVG(segments, totalPosition) {
+    const cx=120, cy=120, r=90, sw=28;
+    const circ = 2*Math.PI*r;
+
+    let offset = 0;
+    const SEGS = segments.map(s => {
+      const dash = (s.pct/100)*circ;
+      const seg = { ...s, dash, offset };
+      offset += dash;
+      return seg;
+    });
+
+    const segPaths = SEGS.map((s,i) =>
+      `<circle data-seg-i="${i}" data-seg-cls="${s.cls}" cx="${cx}" cy="${cy}" r="${r}"
+        fill="none" stroke="${s.color}" stroke-width="${sw}"
+        stroke-dasharray="${s.dash.toFixed(3)} ${(circ-s.dash).toFixed(3)}"
+        stroke-dashoffset="${(circ/4 - s.offset).toFixed(3)}"
+        style="transition:opacity .2s;cursor:pointer"
+        transform="rotate(-90 ${cx} ${cy})"
+      />`
+    ).join('');
+
+    const valStr  = totalPosition >= 1e6 ? (totalPosition/1e6).toFixed(1)+'M' : totalPosition >= 1e3 ? (totalPosition/1e3).toFixed(0)+'k' : totalPosition.toFixed(0);
+    const nCls    = segments.length;
+
+    return `<svg id="nx-dash-donut" viewBox="0 0 240 240" width="240" height="240" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--surface-hover,#f0ece8)" stroke-width="${sw}" />
+      ${segPaths}
+      <text x="${cx}" y="${cy-16}" text-anchor="middle" font-size="10" fill="var(--text-muted,#888)" font-family="inherit" letter-spacing="1">TOTAL</text>
+      <text x="${cx}" y="${cy+2}" text-anchor="middle" font-size="16" fill="var(--text,#1a1a1a)" font-family="Fraunces,serif" font-weight="600">R$ ${valStr}</text>
+      <text x="${cx}" y="${cy+18}" text-anchor="middle" font-size="10" fill="var(--text-muted,#888)" font-family="inherit">${nCls} classe${nCls!==1?'s':''}</text>
+    </svg>`;
+  }
+
+  // ── Bar chart SVG ─────────────────────────────────────────────────────────
+  function buildBarChartSVG(monthKeys, months) {
+    if (!monthKeys.length) {
+      return `<svg width="100%" height="220" xmlns="http://www.w3.org/2000/svg">
+        <text x="50%" y="110" text-anchor="middle" fill="var(--text-muted,#888)" font-size="13">No data for this period</text>
+      </svg>`;
+    }
+
+    const W=600, H=220, padL=52, padR=16, padT=16, padB=36;
+    const chartW = W - padL - padR;
+    const chartH = H - padT - padB;
+
+    const maxVal = Math.max(1, ...monthKeys.map(k => (months[k].buy||0) + (months[k].adj||0) + (months[k].income||0)));
+    const ticks  = [0, maxVal/2, maxVal];
+
+    const slotW  = chartW / monthKeys.length;
+    const barW   = Math.min(slotW * 0.55, 28);
+
+    const MONTH_ABBR = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
+
+    const bars = monthKeys.map((k, i) => {
+      const mo   = months[k];
+      const base = (mo.buy||0) + (mo.adj||0);
+      const inc  = mo.income||0;
+      const sell = mo.sell||0;
+      const x    = padL + slotW*i + slotW/2;
+
+      const hBase = (base/maxVal)*chartH;
+      const hInc  = (inc/maxVal)*chartH;
+      const hSell = (sell/maxVal)*chartH;
+
+      const yBase = padT + chartH - hBase;
+      const yInc  = yBase - hInc;
+
+      const mo2   = months[k];
+      const tt    = `${k}: Buy R$${(mo2.buy||0).toFixed(0)} Adj R$${(mo2.adj||0).toFixed(0)} Income R$${inc.toFixed(0)} Sell R$${sell.toFixed(0)}`;
+
+      let rects = '';
+      if (hBase > 0) rects += `<rect x="${(x - barW/2).toFixed(1)}" y="${yBase.toFixed(1)}" width="${barW.toFixed(1)}" height="${hBase.toFixed(1)}" rx="2" fill="var(--buy,#5C8A6C)" data-tooltip="${tt}" />`;
+      if (hInc  > 0) rects += `<rect x="${(x - barW/2).toFixed(1)}" y="${yInc.toFixed(1)}" width="${barW.toFixed(1)}" height="${hInc.toFixed(1)}" rx="2" fill="#B58A3B" data-tooltip="${tt}" />`;
+      if (hSell > 0) rects += `<rect x="${(x + barW/2 + 2).toFixed(1)}" y="${(padT+chartH - hSell).toFixed(1)}" width="${(barW*0.6).toFixed(1)}" height="${hSell.toFixed(1)}" rx="2" fill="var(--sell,#C0614A)" data-tooltip="${tt}" />`;
+
+      const [yr,mo3] = k.split('-');
+      const lbl = MONTH_ABBR[parseInt(mo3,10)-1] + (yr !== String(new Date().getFullYear()) ? ' '+yr.slice(2) : '');
+      const xlbl = `<text x="${x.toFixed(1)}" y="${(H-padB+14).toFixed(1)}" text-anchor="middle" font-size="10" fill="var(--text-muted,#888)">${lbl}</text>`;
+
+      return rects + xlbl;
+    }).join('');
+
+    const tickLines = ticks.map(v => {
+      const y = padT + chartH - (v/maxVal)*chartH;
+      return `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${W-padR}" y2="${y.toFixed(1)}" stroke="var(--border,#e0dbd5)" stroke-width="1" stroke-dasharray="3 3"/>
+        <text x="${(padL-4).toFixed(1)}" y="${(y+4).toFixed(1)}" text-anchor="end" font-size="9" fill="var(--text-muted,#888)">${fmtK(v)}</text>`;
+    }).join('');
+
+    return `<svg id="nx-dash-bars" viewBox="0 0 ${W} ${H}" width="100%" height="220" xmlns="http://www.w3.org/2000/svg" style="overflow:visible">
+      ${tickLines}
+      ${bars}
+    </svg>`;
+  }
+
+  // ── Main render ───────────────────────────────────────────────────────────
+  function renderPage() {
+    const root = document.getElementById('nx-dash-root');
+    if (!root) return;
+
+    const data = calcPortfolio();
+    const { assets, totalPosition, totalIncome, dividendCount, couponCount,
+            totalCostBasis, totalPL, totalPLpct, irr, firstTxDate, allTxs } = data;
+
+    // ── Empty state ──
+    if (!assets.length) {
+      root.innerHTML = `
+        <div class="nx-dash-empty">
+          <div class="nx-dash-empty-icon">📊</div>
+          <h2>No investments yet</h2>
+          <p>Start tracking your portfolio by adding your first transaction.</p>
+          <button data-action="goto-tx" class="nx-dash-btn-accent">＋ Add your first transaction</button>
+        </div>`;
+      return;
+    }
+
+    // ── KPI Cards ──
+    const plSign = totalPL >= 0 ? '+' : '−';
+    const irrVal = irr != null ? (irr*100).toFixed(2)+'%' : '—';
+    const irrSign = irr != null && irr >= 0 ? '+' : (irr != null ? '−' : '');
+    const irrSub = firstTxDate
+      ? `annualized · since ${fmtDate(firstTxDate)}`
+      : 'not enough data yet';
+    const irrDisplay = irr != null ? (irrSign + Math.abs(irr*100).toFixed(2)+'%') : '—';
+    const irrColor   = irr != null ? (irr >= 0 ? 'var(--pos,#3a7d44)' : 'var(--neg,#b52b27)') : 'var(--text,#1a1a1a)';
+
+    const plColor   = totalPL >= 0 ? 'var(--pos,#3a7d44)' : 'var(--neg,#b52b27)';
+    const plPctPill = `<span class="nx-dash-pill ${totalPL>=0?'nx-dash-pill-pos':'nx-dash-pill-neg'}">${totalPL>=0?'▲':'▼'} ${Math.abs(totalPLpct).toFixed(2)}%</span>`;
+
+    // ── Allocation by class ──
+    const byClass = {};
+    assets.forEach(a => {
+      const cls = a.assetClass || 'Other';
+      if (!byClass[cls]) byClass[cls] = { cls, color: classColor(cls), position: 0, assets: [] };
+      byClass[cls].position += a.position;
+      byClass[cls].assets.push(a);
+    });
+    const classSegs = Object.values(byClass)
+      .sort((a,b) => b.position - a.position)
+      .map(c => ({ ...c, pct: totalPosition > 0 ? (c.position/totalPosition)*100 : 0 }));
+
+    const donutSVG = buildDonutSVG(classSegs, totalPosition);
+
+    // Allocation list HTML
+    let allocListHTML = '';
+    if (state.allocationView === 'class') {
+      classSegs.forEach(c => {
+        allocListHTML += `
+          <div class="nx-dash-alloc-row">
+            <div class="nx-dash-dot" style="background:${c.color}"></div>
+            <div class="nx-dash-alloc-info">
+              <div class="nx-dash-alloc-name">${c.cls}</div>
+              <div class="nx-dash-alloc-sub">${c.assets.length} asset${c.assets.length!==1?'s':''}</div>
+              <div class="nx-dash-alloc-bar-wrap"><div class="nx-dash-alloc-bar" style="width:${c.pct.toFixed(1)}%;background:${c.color}"></div></div>
+            </div>
+            <div class="nx-dash-alloc-pct">${c.pct.toFixed(1)}%</div>
+            <div class="nx-dash-alloc-val">${fmtBRL(c.position)}</div>
+          </div>`;
+      });
+    } else {
+      assets.slice().sort((a,b) => b.position - a.position).forEach(a => {
+        const color = classColor(a.assetClass);
+        allocListHTML += `
+          <div class="nx-dash-alloc-row">
+            <div class="nx-dash-dot" style="background:${color}"></div>
+            <div class="nx-dash-alloc-info">
+              <div class="nx-dash-alloc-name">${a.name}</div>
+              <div class="nx-dash-alloc-sub">${a.assetClass}${a.ticker?' · '+a.ticker:''}</div>
+              <div class="nx-dash-alloc-bar-wrap"><div class="nx-dash-alloc-bar" style="width:${a.allocation.toFixed(1)}%;background:${color}"></div></div>
+            </div>
+            <div class="nx-dash-alloc-pct">${a.allocation.toFixed(1)}%</div>
+            <div class="nx-dash-alloc-val">${fmtBRL(a.position)}</div>
+          </div>`;
+      });
+    }
+
+    const nClasses  = classSegs.length;
+    const allocToggleLabel = state.allocationView === 'class' ? 'By asset →' : 'By class →';
+
+    // ── Holdings table ──
+    const holdingsRows = assets.slice().sort((a,b) => b.position - a.position).map(a => {
+      const plColor2 = a.pl >= 0 ? 'var(--pos,#3a7d44)' : 'var(--neg,#b52b27)';
+      const plSign2  = a.pl >= 0 ? '+' : '−';
+      const plPct2   = a.costBasis > 0 ? (a.pl / a.costBasis)*100 : 0;
+      const clr = classColor(a.assetClass);
+      const unit = a.fi ? 'units' : 'shares';
+      const costLbl = a.fi ? 'per unit' : 'per share';
+      return `
+        <tr class="nx-dash-row" data-asset-id="${a.id}">
+          <td class="nx-dash-td">
+            <div class="nx-dash-asset-name">${a.name}</div>
+            <div class="nx-dash-asset-sub">
+              <span class="nx-dash-badge" style="background:${clr}22;color:${clr}">${a.assetClass}</span>
+              ${a.ticker ? '<span class="nx-dash-ticker">'+a.ticker+'</span>' : ''}
+              ${a.firstBuyDate ? '· since '+fmtDate(a.firstBuyDate) : ''}
+            </div>
+          </td>
+          <td class="nx-dash-td nx-dash-right">
+            <div class="nx-dash-tabnum">${a.qtyNet > 0 ? a.qtyNet.toFixed(a.fi?0:4) : '—'}</div>
+            <div class="nx-dash-muted">${unit}</div>
+          </td>
+          <td class="nx-dash-td nx-dash-right">
+            <div class="nx-dash-tabnum">${fmtBRL(a.avgPrice)}</div>
+            <div class="nx-dash-muted">${costLbl}</div>
+          </td>
+          <td class="nx-dash-td nx-dash-right">
+            <div><span class="nx-dash-muted">R$</span> <span style="font-family:Fraunces,serif;font-size:15.5px;font-weight:600">${Math.abs(a.position).toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2})}</span></div>
+          </td>
+          <td class="nx-dash-td">
+            <div style="display:flex;align-items:center;gap:8px">
+              <div style="flex:1;height:6px;background:var(--surface-hover,#f0ece8);border-radius:999px;overflow:hidden">
+                <div style="height:100%;width:${a.allocation.toFixed(1)}%;background:${clr};border-radius:999px"></div>
+              </div>
+              <span class="nx-dash-tabnum" style="min-width:42px;text-align:right">${a.allocation.toFixed(1)}%</span>
+            </div>
+          </td>
+          <td class="nx-dash-td nx-dash-right">
+            <div style="font-family:Fraunces,serif;font-weight:600;color:${plColor2}">${plSign2} ${fmtBRL(a.pl)}</div>
+            <div class="nx-dash-muted">${plPct2>=0?'+':''}${plPct2.toFixed(2)}%</div>
+          </td>
+        </tr>`;
+    }).join('');
+
+    // ── Flows ──
+    const allAssets = loadAssets();
+    const { monthKeys, months, totals } = getFlowData(allTxs, allAssets, state.period);
+    const barSVG = buildBarChartSVG(monthKeys, months);
+    const netContrib = totals.buy + totals.adj - totals.sell;
+
+    const periodBtns = ['month','30d','year','all'].map(p => {
+      const labels = { month:'This month', '30d':'Last 30 days', year:'This year', all:'All' };
+      const active = state.period === p ? ' nx-dash-period-active' : '';
+      return `<button class="nx-dash-period-btn${active}" data-action="set-period" data-period="${p}">${labels[p]}</button>`;
+    }).join('');
+
+    root.innerHTML = `
+      <div id="nx-dash-tooltip" style="display:none;position:fixed;z-index:9999;pointer-events:none;background:var(--surface,#fff);border:1px solid var(--border,#e0dbd5);border-radius:8px;padding:8px 12px;font-size:12px;box-shadow:0 4px 16px rgba(0,0,0,.12)"></div>
+
+      <!-- Header -->
+      <div class="nx-dash-header">
+        <div>
+          <h1 class="nx-dash-title">Investments Dashboard</h1>
+          <p class="nx-dash-subtitle">Portfolio value, allocation, and performance — at a glance.</p>
+        </div>
+        <div class="nx-dash-header-actions">
+          <button class="nx-dash-btn-outline" data-action="export">Export</button>
+          <button class="nx-dash-btn-accent"  data-action="goto-tx">＋ Transaction</button>
+        </div>
+      </div>
+
+      <!-- KPI Strip -->
+      <div class="nx-dash-kpi-grid">
+        <!-- Hero: Portfolio Value -->
+        <div class="nx-dash-kpi nx-dash-kpi-hero">
+          <div class="nx-dash-kpi-label">PORTFOLIO VALUE</div>
+          <div class="nx-dash-kpi-value nx-dash-fraunces42">${fmtBRL(totalPosition)}</div>
+          <div class="nx-dash-kpi-meta">
+            ${plPctPill}
+            <span class="nx-dash-pill ${totalPL>=0?'nx-dash-pill-pos':'nx-dash-pill-neg'}">${plSign} ${fmtBRL(totalPL)}</span>
+            <span class="nx-dash-muted" style="font-size:12px">vs cost basis · ${fmtBRL(totalCostBasis)}</span>
+          </div>
+        </div>
+        <!-- Income -->
+        <div class="nx-dash-kpi">
+          <div class="nx-dash-kpi-label">INCOME (ALL-TIME) <span class="nx-dash-info-icon" data-tooltip-text="Soma de dividendos e cupons recebidos em toda a história do portfolio">ⓘ</span></div>
+          <div class="nx-dash-kpi-value nx-dash-fraunces28">${fmtBRL(totalIncome)}</div>
+          <div class="nx-dash-kpi-meta nx-dash-muted" style="font-size:12px">${dividendCount} dividend${dividendCount!==1?'s':''} · ${couponCount} coupon${couponCount!==1?'s':''}</div>
+        </div>
+        <!-- Total P/L -->
+        <div class="nx-dash-kpi">
+          <div class="nx-dash-kpi-label">TOTAL P/L</div>
+          <div class="nx-dash-kpi-value nx-dash-fraunces28" style="color:${plColor}">${plSign} ${fmtBRL(totalPL)}</div>
+          <div class="nx-dash-kpi-meta">${plPctPill} <span class="nx-dash-muted" style="font-size:12px">unrealized</span></div>
+        </div>
+        <!-- IRR -->
+        <div class="nx-dash-kpi">
+          <div class="nx-dash-kpi-label">PORTFOLIO IRR <span class="nx-dash-info-icon" data-tooltip-text="Taxa interna de retorno anualizada, calculada sobre os fluxos de caixa do portfolio">ⓘ</span></div>
+          <div class="nx-dash-kpi-value nx-dash-fraunces28" style="color:${irrColor}">${irrDisplay}</div>
+          <div class="nx-dash-kpi-meta nx-dash-muted" style="font-size:12px">${irrSub}</div>
+        </div>
+      </div>
+
+      <!-- Allocation -->
+      <div class="nx-dash-card">
+        <div class="nx-dash-card-header">
+          <span class="nx-dash-card-title">Allocation</span>
+          <span class="nx-dash-pill-neutral">${nClasses} classe${nClasses!==1?'s':''} · ${assets.length} asset${assets.length!==1?'s':''}</span>
+          <button class="nx-dash-btn-ghost" data-action="toggle-alloc-view">${allocToggleLabel}</button>
+        </div>
+        <div class="nx-dash-alloc-grid">
+          <div id="nx-dash-donut-wrap">${donutSVG}</div>
+          <div class="nx-dash-alloc-list">${allocListHTML}</div>
+        </div>
+      </div>
+
+      <!-- Holdings -->
+      <div class="nx-dash-card">
+        <div class="nx-dash-card-header">
+          <span class="nx-dash-card-title">Holdings</span>
+          <span class="nx-dash-pill-neutral">${assets.length} asset${assets.length!==1?'s':''} · sorted by value</span>
+          <button class="nx-dash-btn-ghost" data-action="goto-tx">See all transactions →</button>
+        </div>
+        <div style="overflow-x:auto">
+          <table class="nx-dash-table">
+            <thead>
+              <tr>
+                <th class="nx-dash-th">Asset</th>
+                <th class="nx-dash-th nx-dash-right">Quantity</th>
+                <th class="nx-dash-th nx-dash-right">Avg cost</th>
+                <th class="nx-dash-th nx-dash-right">Current value</th>
+                <th class="nx-dash-th">Allocation</th>
+                <th class="nx-dash-th nx-dash-right">P/L</th>
+              </tr>
+            </thead>
+            <tbody>${holdingsRows}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Investment Flows -->
+      <div class="nx-dash-card">
+        <div class="nx-dash-card-header">
+          <span class="nx-dash-card-title">Investment flows</span>
+          <span class="nx-dash-pill-neutral">Capital in/out and income · monthly</span>
+          <div class="nx-dash-period-seg">${periodBtns}</div>
+        </div>
+        <div class="nx-dash-flows-grid">
+          <div>${barSVG}</div>
+          <div class="nx-dash-flows-tiles">
+            <div class="nx-dash-tile">
+              <div class="nx-dash-tile-label"><span class="nx-dash-dot" style="background:var(--accent,#E07A5F)"></span> Net contributions</div>
+              <div class="nx-dash-tile-val">${fmtBRL(netContrib)}</div>
+            </div>
+            <div class="nx-dash-tile">
+              <div class="nx-dash-tile-label"><span class="nx-dash-dot" style="background:var(--buy,#5C8A6C)"></span> Buys &amp; adjustments</div>
+              <div class="nx-dash-tile-val">${fmtBRL(totals.buy + totals.adj)}</div>
+            </div>
+            <div class="nx-dash-tile">
+              <div class="nx-dash-tile-label"><span class="nx-dash-dot" style="background:var(--sell,#C0614A)"></span> Sells</div>
+              <div class="nx-dash-tile-val">${fmtBRL(totals.sell)}</div>
+            </div>
+            <div class="nx-dash-tile">
+              <div class="nx-dash-tile-label"><span class="nx-dash-dot" style="background:#B58A3B"></span> Income</div>
+              <div class="nx-dash-tile-val">${fmtBRL(totals.income)}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    // ── Donut hover ──
+    const donutEl = document.getElementById('nx-dash-donut');
+    const tooltip  = document.getElementById('nx-dash-tooltip');
+    if (donutEl && tooltip) {
+      donutEl.addEventListener('mouseover', e => {
+        const seg = e.target.closest('[data-seg-i]');
+        if (!seg) return;
+        const i = parseInt(seg.getAttribute('data-seg-i'), 10);
+        const cls = classSegs[i];
+        if (!cls) return;
+        donutEl.querySelectorAll('[data-seg-i]').forEach((s, si) => {
+          s.style.opacity = si === i ? '1' : '0.3';
+        });
+        tooltip.style.display = 'block';
+        tooltip.innerHTML = `<b>${cls.cls}</b>: ${fmtBRL(cls.position)} (${cls.pct.toFixed(1)}%)`;
+      });
+      donutEl.addEventListener('mousemove', e => {
+        if (tooltip.style.display === 'none') return;
+        tooltip.style.left = (e.clientX + 14) + 'px';
+        tooltip.style.top  = (e.clientY - 8) + 'px';
+      });
+      donutEl.addEventListener('mouseout', e => {
+        if (!e.relatedTarget || !e.relatedTarget.closest('#nx-dash-donut')) {
+          donutEl.querySelectorAll('[data-seg-i]').forEach(s => s.style.opacity = '1');
+          tooltip.style.display = 'none';
+        }
+      });
+    }
+
+    // ── Bar chart hover ──
+    const barEl = document.getElementById('nx-dash-bars');
+    if (barEl && tooltip) {
+      barEl.addEventListener('mouseover', e => {
+        const bar = e.target.closest('[data-tooltip]');
+        if (!bar) return;
+        tooltip.style.display = 'block';
+        tooltip.innerHTML = bar.getAttribute('data-tooltip').replace(/([A-Z][a-z]+)/g, '<b>$1</b>');
+      });
+      barEl.addEventListener('mousemove', e => {
+        tooltip.style.left = (e.clientX + 14) + 'px';
+        tooltip.style.top  = (e.clientY - 8) + 'px';
+      });
+      barEl.addEventListener('mouseout', () => { tooltip.style.display = 'none'; });
+    }
+
+    // ── Info icon tooltip ──
+    root.querySelectorAll('.nx-dash-info-icon').forEach(el => {
+      const txt = el.getAttribute('data-tooltip-text');
+      el.addEventListener('mouseenter', e => {
+        tooltip.style.display = 'block';
+        tooltip.innerHTML = txt;
+        tooltip.style.left = (e.clientX + 14) + 'px';
+        tooltip.style.top  = (e.clientY - 8) + 'px';
+      });
+      el.addEventListener('mousemove', e => {
+        tooltip.style.left = (e.clientX + 14) + 'px';
+        tooltip.style.top  = (e.clientY - 8) + 'px';
+      });
+      el.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
+    });
+  }
+
+  // ── CSS injection ─────────────────────────────────────────────────────────
+  function injectCSS() {
+    if (document.getElementById('nx-dash-css')) return;
+    const s = document.createElement('style');
+    s.id = 'nx-dash-css';
+    s.textContent = `
+      #nx-dash-root { padding: 24px 28px; max-width: 1200px; margin: 0 auto; font-family: inherit; }
+      .nx-dash-header { display:flex; align-items:flex-start; justify-content:space-between; flex-wrap:wrap; gap:16px; margin-bottom:28px; }
+      .nx-dash-title  { font-family:Fraunces,serif; font-size:32px; font-weight:600; margin:0 0 6px; color:var(--text,#1a1a1a); }
+      .nx-dash-subtitle { color:var(--text-muted,#888); font-size:14px; margin:0; }
+      .nx-dash-header-actions { display:flex; gap:10px; align-items:center; padding-top:4px; }
+
+      /* KPI */
+      .nx-dash-kpi-grid { display:grid; grid-template-columns:2fr 1fr 1fr 1fr; gap:14px; margin-bottom:20px; }
+      .nx-dash-kpi { background:var(--surface,#fff); border:1px solid var(--border,#e0dbd5); border-radius:14px; padding:20px 22px; }
+      .nx-dash-kpi-hero { }
+      .nx-dash-kpi-label { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.06em; color:var(--text-muted,#888); margin-bottom:8px; display:flex; align-items:center; gap:5px; }
+      .nx-dash-kpi-value { margin:4px 0 10px; }
+      .nx-dash-kpi-meta  { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+      .nx-dash-fraunces42 { font-family:Fraunces,serif; font-size:42px; font-weight:600; color:var(--text,#1a1a1a); line-height:1.1; }
+      .nx-dash-fraunces28 { font-family:Fraunces,serif; font-size:28px; font-weight:600; color:var(--text,#1a1a1a); line-height:1.2; }
+
+      /* Pills */
+      .nx-dash-pill { display:inline-flex; align-items:center; border-radius:999px; padding:3px 9px; font-size:12px; font-weight:600; }
+      .nx-dash-pill-pos { background:#dcf0e2; color:#3a7d44; }
+      .nx-dash-pill-neg { background:#fde8e8; color:#b52b27; }
+      .nx-dash-pill-neutral { background:var(--surface-hover,#f5f1ed); color:var(--text-muted,#888); display:inline-flex; align-items:center; border-radius:999px; padding:3px 9px; font-size:12px; }
+
+      /* Buttons */
+      .nx-dash-btn-accent  { background:var(--accent,#E07A5F); color:#fff; border:none; border-radius:8px; padding:9px 16px; font-size:13.5px; font-weight:600; cursor:pointer; }
+      .nx-dash-btn-accent:hover { filter:brightness(1.08); }
+      .nx-dash-btn-outline { background:transparent; color:var(--text,#1a1a1a); border:1.5px solid var(--border,#e0dbd5); border-radius:8px; padding:8px 15px; font-size:13.5px; font-weight:500; cursor:pointer; }
+      .nx-dash-btn-outline:hover { background:var(--surface-hover,#f5f1ed); }
+      .nx-dash-btn-ghost { background:transparent; border:none; color:var(--accent,#E07A5F); font-size:13px; font-weight:500; cursor:pointer; padding:4px 0; margin-left:auto; }
+      .nx-dash-btn-ghost:hover { text-decoration:underline; }
+
+      /* Cards */
+      .nx-dash-card { background:var(--surface,#fff); border:1px solid var(--border,#e0dbd5); border-radius:14px; padding:22px; margin-bottom:20px; }
+      .nx-dash-card-header { display:flex; align-items:center; gap:10px; margin-bottom:20px; flex-wrap:wrap; }
+      .nx-dash-card-title { font-family:Fraunces,serif; font-size:18px; font-weight:600; color:var(--text,#1a1a1a); }
+
+      /* Allocation */
+      .nx-dash-alloc-grid { display:grid; grid-template-columns:280px 1fr; gap:28px; align-items:start; }
+      .nx-dash-alloc-list { display:flex; flex-direction:column; gap:10px; }
+      .nx-dash-alloc-row { display:grid; grid-template-columns:14px 1fr auto auto; gap:10px; align-items:center; }
+      .nx-dash-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; display:inline-block; }
+      .nx-dash-alloc-info { display:flex; flex-direction:column; gap:2px; }
+      .nx-dash-alloc-name { font-weight:600; font-size:14px; color:var(--text,#1a1a1a); }
+      .nx-dash-alloc-sub  { font-size:11px; color:var(--text-muted,#888); }
+      .nx-dash-alloc-bar-wrap { height:6px; background:var(--surface-hover,#f0ece8); border-radius:999px; overflow:hidden; margin-top:4px; width:100%; }
+      .nx-dash-alloc-bar  { height:100%; border-radius:999px; transition:width .4s; }
+      .nx-dash-alloc-pct  { font-family:Fraunces,serif; font-size:16px; font-weight:600; font-variant-numeric:tabular-nums; text-align:right; min-width:50px; }
+      .nx-dash-alloc-val  { font-size:13px; color:var(--text-muted,#888); text-align:right; min-width:90px; }
+
+      /* Holdings table */
+      .nx-dash-table { width:100%; border-collapse:collapse; font-size:13.5px; }
+      .nx-dash-th { text-align:left; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.05em; color:var(--text-muted,#888); padding:8px 12px; border-bottom:1px solid var(--border,#e0dbd5); white-space:nowrap; }
+      .nx-dash-td { padding:14px 12px; border-bottom:1px solid var(--border,#e0dbd5); vertical-align:middle; }
+      .nx-dash-row:hover td { background:var(--surface-hover,#f5f1ed); }
+      .nx-dash-right { text-align:right; }
+      .nx-dash-asset-name { font-weight:700; font-size:14px; color:var(--text,#1a1a1a); }
+      .nx-dash-asset-sub  { font-size:11.5px; color:var(--text-muted,#888); margin-top:2px; display:flex; align-items:center; gap:5px; flex-wrap:wrap; }
+      .nx-dash-badge { border-radius:4px; padding:1px 6px; font-size:11px; font-weight:600; }
+      .nx-dash-ticker { font-weight:600; color:var(--text-muted,#888); }
+      .nx-dash-tabnum { font-variant-numeric:tabular-nums; }
+      .nx-dash-muted  { color:var(--text-muted,#888); font-size:12px; }
+
+      /* Flows */
+      .nx-dash-flows-grid { display:grid; grid-template-columns:1fr 260px; gap:24px; align-items:start; }
+      .nx-dash-period-seg { display:flex; gap:0; margin-left:auto; border:1px solid var(--border,#e0dbd5); border-radius:8px; overflow:hidden; }
+      .nx-dash-period-btn { background:transparent; border:none; border-right:1px solid var(--border,#e0dbd5); padding:6px 12px; font-size:12px; font-weight:500; cursor:pointer; color:var(--text-muted,#888); }
+      .nx-dash-period-btn:last-child { border-right:none; }
+      .nx-dash-period-btn:hover { background:var(--surface-hover,#f5f1ed); }
+      .nx-dash-period-active { background:var(--accent,#E07A5F) !important; color:#fff !important; font-weight:600; }
+      .nx-dash-flows-tiles { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+      .nx-dash-tile { border:1px solid var(--border,#e0dbd5); border-radius:10px; padding:14px; }
+      .nx-dash-tile-label { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--text-muted,#888); margin-bottom:8px; }
+      .nx-dash-tile-val { font-family:Fraunces,serif; font-size:19px; font-weight:600; color:var(--text,#1a1a1a); }
+
+      /* Info icon */
+      .nx-dash-info-icon { cursor:help; font-size:12px; color:var(--text-muted,#888); }
+
+      /* Empty */
+      .nx-dash-empty { display:flex; flex-direction:column; align-items:center; justify-content:center; padding:80px 24px; text-align:center; gap:14px; }
+      .nx-dash-empty-icon { font-size:48px; }
+      .nx-dash-empty h2 { font-family:Fraunces,serif; font-size:24px; font-weight:600; margin:0; color:var(--text,#1a1a1a); }
+      .nx-dash-empty p  { color:var(--text-muted,#888); margin:0; font-size:14px; }
+
+      /* Responsive */
+      @media (max-width:1100px) {
+        .nx-dash-kpi-grid { grid-template-columns:1fr 1fr; }
+        .nx-dash-kpi-hero { grid-column:1/-1; }
+        .nx-dash-alloc-grid, .nx-dash-flows-grid { grid-template-columns:1fr; }
+        .nx-dash-flows-tiles { grid-template-columns:1fr 1fr; }
+      }
+      @media (max-width:640px) {
+        #nx-dash-root { padding:14px 12px; }
+        .nx-dash-kpi-grid { grid-template-columns:1fr; }
+        .nx-dash-flows-tiles { grid-template-columns:1fr; }
+        .nx-dash-fraunces42 { font-size:30px; }
+        .nx-dash-fraunces28 { font-size:22px; }
+      }
+    `;
+    document.head.appendChild(s);
+  }
+
+  // ── Event delegation ──────────────────────────────────────────────────────
+  function setupEvents() {
+    document.addEventListener('click', e => {
+      const el = e.target.closest('[data-action]');
+      if (!el) return;
+      const root = document.getElementById('nx-dash-root');
+      if (!root || !root.contains(el)) return;
+      const action = el.getAttribute('data-action');
+      if (action === 'goto-tx') { goToInvestmentsTx(); return; }
+      if (action === 'set-period') {
+        state.period = el.getAttribute('data-period');
+        renderPage();
+        return;
+      }
+      if (action === 'toggle-alloc-view') {
+        state.allocationView = state.allocationView === 'class' ? 'asset' : 'class';
+        renderPage();
+        return;
+      }
+      if (action === 'export') {
+        // Basic CSV export
+        const data = calcPortfolio();
+        const rows = [['Asset','Class','Ticker','Position (R$)','Avg Cost','Qty','P/L (R$)','Allocation %']];
+        data.assets.forEach(a => {
+          rows.push([a.name, a.assetClass, a.ticker||'', a.position.toFixed(2), a.avgPrice.toFixed(2), a.qtyNet, a.pl.toFixed(2), a.allocation.toFixed(2)]);
+        });
+        const csv = rows.map(r => r.map(v => '"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\n');
+        const blob = new Blob([csv], { type:'text/csv' });
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement('a');
+        a.href = url; a.download = 'portfolio-export.csv'; a.click();
+        URL.revokeObjectURL(url);
+        return;
+      }
+    });
+  }
+
+  // ── Nav detection & mount/unmount ─────────────────────────────────────────
+  function getActiveNavLabel() {
+    const btn = document.querySelector('.sidebar button.nav-item.active');
+    if (!btn) return '';
+    let lbl = '';
+    btn.childNodes.forEach(n => { if (n.nodeType === 3) lbl += n.textContent.trim(); });
+    return lbl;
+  }
+  function isInvestmentsDashboard() {
+    const lbl = getActiveNavLabel();
+    return /investment/i.test(lbl) && !/trans/i.test(lbl);
+  }
+
+  let _mounted = false, _container = null;
+
+  function mount() {
+    if (_mounted) return;
+    injectCSS();
+    const main = document.querySelector('.main');
+    if (!main) return;
+    Array.from(main.children).forEach(el => { el.dataset.nxDashHidden = '1'; el.style.display = 'none'; });
+    _container = document.createElement('div');
+    _container.id = 'nx-dash-root';
+    main.appendChild(_container);
+    _mounted = true;
+    // Carrega dados frescos do Gist antes do primeiro render
+    loadFromGist().finally(() => { if (_mounted) renderPage(); });
+  }
+
+  function unmount() {
+    if (!_mounted) return;
+    if (_container) { _container.remove(); _container = null; }
+    const main = document.querySelector('.main');
+    if (main) Array.from(main.children).forEach(el => {
+      if (el.dataset.nxDashHidden) { el.style.display = ''; delete el.dataset.nxDashHidden; }
+    });
+    _mounted = false;
+  }
+
+  setupEvents();
+
+  let _lastDash = false;
+  new MutationObserver(() => {
+    const now = isInvestmentsDashboard();
+    if (now === _lastDash) return;
+    _lastDash = now;
+    now ? mount() : unmount();
+  }).observe(document.body, { subtree: true, attributes: true, attributeFilter: ['class'] });
+
+  setTimeout(() => { _lastDash = isInvestmentsDashboard(); if (_lastDash) mount(); }, 700);
+})();
+</script>
+  <script>
+/* ── Nexo — Investments Transactions Redesign ───────────────────────────── */
+(function () {
+  'use strict';
+
+  // ── 1. CSS INJECTION ────────────────────────────────────────────────────
+  const CSS = `
+    :root {
+      --buy: #5C8A6C; --buy-light: #E8F0EA;
+      --sell: #C25450; --sell-light: #F6E6E5;
+      --div: #B58A3B; --div-light: #F6EDD9;
+      --coup: #4C7A99; --coup-light: #E2EBF1;
+      --adj: #7A756F; --adj-light: #EFEAE3;
+    }
+    #nx-it-root {
+      font-family: inherit;
+      padding: 32px 40px;
+      max-width: 1400px;
+      margin: 0 auto;
+      box-sizing: border-box;
+    }
+    #nx-it-root * { box-sizing: border-box; }
+
+    /* Page Header */
+    .nx-page-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 28px; gap: 16px; }
+    .nx-page-header-left h1 { font-family: 'Fraunces', Georgia, serif; font-size: 32px; font-weight: 600; margin: 0 0 4px; color: var(--text-primary, #1a1a1a); }
+    .nx-page-header-left p { margin: 0; font-size: 14px; color: var(--text-secondary, #6b6b6b); }
+    .nx-header-btns { display: flex; gap: 10px; align-items: center; flex-shrink: 0; }
+    .nx-btn { display: inline-flex; align-items: center; gap: 6px; padding: 9px 16px; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; border: none; transition: all .15s; }
+    .nx-btn-outline { background: transparent; border: 1.5px solid var(--accent, #E07A5F); color: var(--accent, #E07A5F); }
+    .nx-btn-outline:hover { background: rgba(224,122,95,.08); }
+    .nx-btn-primary { background: var(--accent, #E07A5F); color: #fff; }
+    .nx-btn-primary:hover { opacity: .9; }
+    .nx-btn-sm { padding: 6px 12px; font-size: 13px; }
+    .nx-btn-ghost { background: transparent; color: var(--text-secondary, #6b6b6b); }
+    .nx-btn-ghost:hover { background: rgba(0,0,0,.05); }
+    .nx-btn-danger { background: var(--sell, #C25450); color: #fff; }
+    .nx-btn-danger:hover { opacity: .9; }
+    .nx-btn:disabled { opacity: .4; cursor: default; }
+
+    /* Filter card */
+    .nx-filter-card { background: var(--card-bg, #fff); border: 1px solid var(--border, #e8e8e8); border-radius: 12px; padding: 18px 20px; margin-bottom: 28px; }
+    .nx-filter-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 14px; }
+    @media (max-width: 900px) { .nx-filter-grid { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 540px) { .nx-filter-grid { grid-template-columns: 1fr; } }
+    .nx-filter-field label { display: block; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--text-secondary, #6b6b6b); margin-bottom: 5px; }
+    .nx-filter-field input, .nx-filter-field select {
+      width: 100%; padding: 8px 10px; border-radius: 7px;
+      border: 1.5px solid var(--border, #e8e8e8);
+      font-size: 13px; color: var(--text-primary, #1a1a1a);
+      background: var(--input-bg, #fafafa);
+      outline: none; transition: border-color .15s;
+    }
+    .nx-filter-field input:focus, .nx-filter-field select:focus { border-color: var(--accent, #E07A5F); }
+    .nx-chips { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
+    .nx-chip { display: inline-flex; align-items: center; gap: 5px; padding: 5px 12px; border-radius: 20px; font-size: 12px; font-weight: 500; cursor: pointer; border: 1.5px solid transparent; background: var(--bg-subtle, #f5f5f5); color: var(--text-secondary, #6b6b6b); transition: all .15s; user-select: none; }
+    .nx-chip:hover { border-color: var(--accent, #E07A5F); }
+    .nx-chip.nx-chip-active { border-color: var(--accent, #E07A5F); background: rgba(224,122,95,.1); color: var(--accent, #E07A5F); }
+    .nx-chip-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+    .nx-clear-btn { margin-left: auto; font-size: 12px; color: var(--text-secondary, #6b6b6b); background: none; border: none; cursor: pointer; padding: 4px 8px; border-radius: 5px; }
+    .nx-clear-btn:hover { background: rgba(0,0,0,.06); }
+
+    /* Sections */
+    .nx-section { margin-bottom: 28px; }
+    .nx-section-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+    .nx-section-title { font-size: 17px; font-weight: 600; margin: 0; color: var(--text-primary, #1a1a1a); }
+    .nx-pill { display: inline-flex; align-items: center; padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 500; background: var(--bg-subtle, #f0f0f0); color: var(--text-secondary, #6b6b6b); }
+    .nx-collapse-btn { margin-left: auto; background: none; border: none; cursor: pointer; font-size: 18px; color: var(--text-secondary, #6b6b6b); padding: 2px 6px; border-radius: 5px; line-height: 1; }
+    .nx-collapse-btn:hover { background: rgba(0,0,0,.06); }
+    .nx-section-view-toggle { margin-left: auto; display: flex; gap: 4px; background: var(--bg-subtle, #f0f0f0); border-radius: 8px; padding: 3px; }
+    .nx-vt-btn { background: none; border: none; cursor: pointer; padding: 5px 10px; border-radius: 5px; font-size: 12px; font-weight: 500; color: var(--text-secondary, #6b6b6b); }
+    .nx-vt-btn.active { background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.12); color: var(--text-primary, #1a1a1a); }
+
+    /* Asset Grid */
+    .nx-asset-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; }
+    @media (max-width: 1100px) { .nx-asset-grid { grid-template-columns: 1fr; } }
+
+    /* Asset Card */
+    .nx-asset-card { background: var(--card-bg, #fff); border: 1px solid var(--border, #e8e8e8); border-radius: 14px; padding: 20px 22px 0; overflow: hidden; }
+    .nx-asset-card-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 18px; }
+    .nx-asset-card-name { font-size: 15px; font-weight: 600; color: var(--text-primary, #1a1a1a); margin: 0 0 3px; }
+    .nx-asset-card-meta { font-size: 12px; color: var(--text-secondary, #6b6b6b); }
+    .nx-asset-class-badge { display: inline-block; padding: 2px 8px; border-radius: 8px; font-size: 11px; font-weight: 600; background: var(--bg-subtle, #f0f0f0); color: var(--text-secondary, #6b6b6b); margin-left: 5px; }
+    .nx-asset-actions { display: flex; gap: 6px; align-items: center; }
+    .nx-stats-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-bottom: 0; }
+    .nx-stat { padding: 14px 16px; background: var(--bg-subtle, #fafafa); border-radius: 10px; }
+    .nx-stat-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--text-secondary, #6b6b6b); margin-bottom: 6px; }
+    .nx-stat-value { font-size: 18px; font-weight: 600; color: var(--text-primary, #1a1a1a); margin-bottom: 2px; font-family: 'Fraunces', Georgia, serif; }
+    .nx-stat-sub { font-size: 11px; color: var(--text-secondary, #6b6b6b); }
+    .nx-stat-accent { color: var(--accent, #E07A5F) !important; }
+    .nx-stat-buy { color: var(--buy, #5C8A6C) !important; }
+    .nx-stat-sell { color: var(--sell, #C25450) !important; }
+
+    /* Editable input stat */
+    .nx-editable-wrap { position: relative; }
+    .nx-editable-input-row { display: flex; align-items: center; gap: 6px; }
+    .nx-editable-prefix { font-size: 13px; color: var(--text-secondary, #6b6b6b); font-weight: 500; }
+    .nx-editable-input {
+      font-size: 18px; font-weight: 600; font-family: 'Fraunces', Georgia, serif;
+      border: none; border-bottom: 2px solid var(--accent, #E07A5F);
+      background: transparent; outline: none; width: 100%; min-width: 0;
+      color: var(--text-primary, #1a1a1a); padding: 0;
+    }
+    .nx-editable-confirm { background: var(--accent, #E07A5F); color: #fff; border: none; border-radius: 5px; padding: 3px 8px; font-size: 12px; cursor: pointer; flex-shrink: 0; }
+    .nx-editable-confirm:disabled { opacity: .35; cursor: default; }
+    .nx-editable-sub { font-size: 11px; margin-top: 4px; min-height: 14px; }
+
+    /* Card footer */
+    .nx-asset-footer { border-top: 1.5px dashed var(--border, #e0e0e0); margin: 16px -22px 0; padding: 12px 22px; display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--text-secondary, #6b6b6b); gap: 8px; }
+    .nx-asset-footer-left { font-weight: 500; }
+    .nx-asset-footer-right { color: var(--text-secondary, #6b6b6b); }
+
+    /* Empty state */
+    .nx-empty { text-align: center; padding: 48px 24px; color: var(--text-secondary, #6b6b6b); }
+    .nx-empty-icon { font-size: 40px; margin-bottom: 12px; }
+    .nx-empty h3 { margin: 0 0 8px; font-size: 17px; font-weight: 600; color: var(--text-primary, #1a1a1a); }
+    .nx-empty p { margin: 0 0 16px; font-size: 14px; }
+
+    /* Transactions table */
+    .nx-table-wrap { background: var(--card-bg, #fff); border: 1px solid var(--border, #e8e8e8); border-radius: 14px; overflow: hidden; }
+    .nx-month-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 18px; background: var(--bg-subtle, #f7f7f5); border-bottom: 1px solid var(--border, #e8e8e8); }
+    .nx-month-label { font-size: 13px; font-weight: 700; color: var(--text-primary, #1a1a1a); text-transform: uppercase; letter-spacing: .05em; }
+    .nx-month-meta { font-size: 12px; color: var(--text-secondary, #6b6b6b); }
+    table.nx-table { width: 100%; border-collapse: collapse; }
+    table.nx-table th { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--text-secondary, #6b6b6b); padding: 10px 16px; border-bottom: 1px solid var(--border, #e8e8e8); text-align: left; background: var(--card-bg, #fff); white-space: nowrap; }
+    table.nx-table td { padding: 12px 16px; border-bottom: 1px solid var(--border, #e8e8e8); font-size: 13px; color: var(--text-primary, #1a1a1a); vertical-align: middle; }
+    table.nx-table tr:last-child td { border-bottom: none; }
+    table.nx-table tr:hover td { background: var(--bg-subtle, #fafafa); }
+    .nx-table-actions { display: flex; gap: 4px; opacity: 0; transition: opacity .15s; }
+    table.nx-table tr:hover .nx-table-actions { opacity: 1; }
+    .nx-tbl-icon-btn { background: none; border: none; cursor: pointer; padding: 4px 6px; border-radius: 5px; font-size: 14px; color: var(--text-secondary, #6b6b6b); }
+    .nx-tbl-icon-btn:hover { background: rgba(0,0,0,.07); }
+    .nx-tbl-icon-btn.nx-danger:hover { background: var(--sell-light, #F6E6E5); color: var(--sell, #C25450); }
+
+    /* Type badge */
+    .nx-type-badge { display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px; border-radius: 12px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+    .nx-badge-buy { background: var(--buy-light); color: var(--buy); }
+    .nx-badge-sell { background: var(--sell-light); color: var(--sell); }
+    .nx-badge-div { background: var(--div-light); color: var(--div); }
+    .nx-badge-coup { background: var(--coup-light); color: var(--coup); }
+    .nx-badge-adj { background: var(--adj-light); color: var(--adj); }
+
+    /* Asset name in table */
+    .nx-asset-name-cell { }
+    .nx-asset-ticker-meta { font-size: 11px; color: var(--text-secondary, #6b6b6b); margin-top: 1px; }
+
+    /* Total colorized */
+    .nx-total-buy { color: var(--sell, #C25450); font-family: 'Fraunces', Georgia, serif; font-weight: 600; }
+    .nx-total-sell { color: var(--buy, #5C8A6C); font-family: 'Fraunces', Georgia, serif; font-weight: 600; }
+    .nx-total-income { color: var(--div, #B58A3B); font-family: 'Fraunces', Georgia, serif; font-weight: 600; }
+    .nx-total-adj { color: var(--adj, #7A756F); font-family: 'Fraunces', Georgia, serif; font-weight: 600; }
+
+    /* Date cell */
+    .nx-date-main { font-weight: 500; }
+    .nx-date-sub { font-size: 11px; color: var(--text-secondary, #6b6b6b); }
+
+    /* Note cell */
+    .nx-note-cell { font-style: italic; color: var(--text-secondary, #6b6b6b); max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    /* Cards view */
+    .nx-cards-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
+    .nx-tx-card { background: var(--card-bg, #fff); border: 1px solid var(--border, #e8e8e8); border-radius: 12px; padding: 16px 18px; }
+    .nx-tx-card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+    .nx-tx-card-field { margin-bottom: 8px; }
+    .nx-tx-card-field-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--text-secondary, #6b6b6b); margin-bottom: 2px; }
+    .nx-tx-card-field-value { font-size: 13px; color: var(--text-primary, #1a1a1a); }
+
+    /* Empty inline */
+    .nx-table-empty { text-align: center; padding: 36px 24px; color: var(--text-secondary, #6b6b6b); }
+    .nx-table-empty a { color: var(--accent, #E07A5F); cursor: pointer; text-decoration: underline; }
+
+    /* Modal overlay */
+    .nx-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 9999; display: flex; align-items: center; justify-content: center; padding: 24px; }
+    .nx-modal { background: var(--card-bg, #fff); border-radius: 16px; padding: 28px 30px; width: 100%; max-width: 500px; max-height: 90vh; overflow-y: auto; box-shadow: 0 20px 60px rgba(0,0,0,.2); }
+    .nx-modal-title { font-size: 20px; font-weight: 700; margin: 0 0 20px; color: var(--text-primary, #1a1a1a); font-family: 'Fraunces', Georgia, serif; }
+    .nx-modal-field { margin-bottom: 16px; }
+    .nx-modal-field label { display: block; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--text-secondary, #6b6b6b); margin-bottom: 6px; }
+    .nx-modal-field input, .nx-modal-field select, .nx-modal-field textarea {
+      width: 100%; padding: 10px 12px; border-radius: 8px;
+      border: 1.5px solid var(--border, #e8e8e8); font-size: 14px;
+      background: var(--input-bg, #fafafa); color: var(--text-primary, #1a1a1a);
+      outline: none; transition: border-color .15s; font-family: inherit;
+    }
+    .nx-modal-field input:focus, .nx-modal-field select:focus, .nx-modal-field textarea:focus { border-color: var(--accent, #E07A5F); }
+    .nx-modal-footer { display: flex; gap: 10px; justify-content: flex-end; margin-top: 24px; }
+
+    /* Confirm mini-modal */
+    .nx-confirm-modal { background: var(--card-bg, #fff); border-radius: 12px; padding: 22px 24px; width: 100%; max-width: 360px; box-shadow: 0 10px 40px rgba(0,0,0,.2); }
+    .nx-confirm-modal p { margin: 0 0 18px; font-size: 14px; color: var(--text-primary, #1a1a1a); }
+
+    /* Inline empty */
+    .nx-tx-empty-row td { text-align: center; padding: 32px; color: var(--text-secondary, #6b6b6b); font-style: italic; }
+
+    /* Stats section in cards view */
+    .nx-month-section { margin-bottom: 20px; }
+
+    /* Allocation % chip in stat */
+    .nx-alloc-chip { display: inline-block; padding: 1px 7px; background: var(--bg-subtle, #f0f0f0); border-radius: 8px; font-size: 11px; font-weight: 600; color: var(--text-secondary, #6b6b6b); margin-left: 6px; }
+  `;
+
+  let _styleEl = null;
+  function injectCSS() {
+    if (_styleEl) return;
+    _styleEl = document.createElement('style');
+    _styleEl.id = 'nx-it-styles';
+    _styleEl.textContent = CSS;
+    document.head.appendChild(_styleEl);
+  }
+
+  // ── 2. HELPERS ──────────────────────────────────────────────────────────
+  function fmtBR(n, decimals = 2) {
+    if (n == null || isNaN(n)) return '—';
+    return new Intl.NumberFormat('pt-BR', { minimumFractionDigits: decimals, maximumFractionDigits: decimals }).format(n);
+  }
+  function fmtQty(n) {
+    if (n == null || isNaN(n)) return '—';
+    return new Intl.NumberFormat('pt-BR', { minimumFractionDigits: 0, maximumFractionDigits: 6 }).format(n);
+  }
+  function parseBR(str) {
+    if (typeof str === 'number') return str;
+    return parseFloat(String(str).replace(/\./g, '').replace(',', '.')) || 0;
+  }
+  function fmtDate(str) {
+    if (!str) return '—';
+    const d = new Date(str + (str.length === 10 ? 'T00:00:00' : ''));
+    return d.toLocaleDateString('pt-BR');
+  }
+  function relativeDate(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    const now = Date.now();
+    const diff = now - d.getTime();
+    const days = Math.floor(diff / 86400000);
+    if (days === 0) return 'today';
+    if (days === 1) return 'yesterday';
+    if (days < 30) return days + ' days ago';
+    const months = Math.floor(days / 30);
+    if (months < 12) return months + (months === 1 ? ' month ago' : ' months ago');
+    const years = Math.floor(months / 12);
+    return years + (years === 1 ? ' year ago' : ' years ago');
+  }
+  function txRelativeDate(str) {
+    if (!str) return '';
+    const d = new Date(str + 'T00:00:00');
+    const now = Date.now();
+    const diff = now - d.getTime();
+    const days = Math.floor(diff / 86400000);
+    if (days === 0) return 'today';
+    if (days === 1) return 'yesterday';
+    return days + ' days ago';
+  }
+  function generateId() {
+    return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  }
+  function monthLabel(dateStr) {
+    if (!dateStr) return 'Unknown';
+    const d = new Date(dateStr + 'T00:00:00');
+    return d.toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
+  }
+  function monthKey(dateStr) {
+    if (!dateStr) return '0000-00';
+    return dateStr.slice(0, 7);
+  }
+  function escHtml(s) {
+    return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  // ── 3. DATA LAYER ────────────────────────────────────────────────────────
+  const ASSETS_KEY = 'nexo_investment_assets';
+  const TXS_KEY = 'nexo_investment_transactions';
+  const VIEW_KEY = 'nexo:investments:txView';
+
+  function getAssets() {
+    try { return JSON.parse(localStorage.getItem(ASSETS_KEY) || '[]'); } catch { return []; }
+  }
+  function getTxs() {
+    try { return JSON.parse(localStorage.getItem(TXS_KEY) || '[]'); } catch { return []; }
+  }
+
+  // ── Gist sync helpers ──────────────────────────────────────────────────────
+  // O Gist usa o formato: { meta:{...}, data:{ ..., investmentAssets:[...], investmentTransactions:[...] } }
+  // O interceptor fetch() já cuida da autenticação — basta chamar /api/sync/data.
+
+  async function loadFromGist() {
+    try {
+      const resp = await fetch('/api/sync/data');
+      if (!resp.ok) return;
+      const json = await resp.json();
+      const d = json && json.payload && json.payload.data;
+      if (!d) return;
+      if (Array.isArray(d.investmentAssets))
+        localStorage.setItem(ASSETS_KEY, JSON.stringify(d.investmentAssets));
+      if (Array.isArray(d.investmentTransactions))
+        localStorage.setItem(TXS_KEY, JSON.stringify(d.investmentTransactions));
+    } catch (e) {
+      console.warn('[Nexo IT] loadFromGist failed:', e);
+    }
+  }
+
+  async function syncToGist(assets, txs) {
+    try {
+      const resp = await fetch('/api/sync/data');
+      if (!resp.ok) return;
+      const json = await resp.json();
+      if (!json || !json.payload) return;
+      const payload = json.payload;
+      if (!payload.data) payload.data = {};
+      payload.data.investmentAssets = assets;
+      payload.data.investmentTransactions = txs;
+      if (!payload.meta) payload.meta = {};
+      payload.meta.updatedAt = new Date().toISOString();
+      await fetch('/api/sync/data', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+    } catch (e) {
+      console.warn('[Nexo IT] syncToGist failed:', e);
+    }
+  }
+
+  function saveAssets(arr) {
+    localStorage.setItem(ASSETS_KEY, JSON.stringify(arr));
+    syncToGist(arr, getTxs());
+  }
+  function saveTxs(arr) {
+    localStorage.setItem(TXS_KEY, JSON.stringify(arr));
+    syncToGist(getAssets(), arr);
+  }
+  function saveAsset(asset) {
+    const arr = getAssets();
+    const idx = arr.findIndex(a => a.id === asset.id);
+    if (idx >= 0) arr[idx] = asset; else arr.push(asset);
+    saveAssets(arr);
+  }
+
+  // ── 4. CALCULATIONS ──────────────────────────────────────────────────────
+  const FIXED_INCOME = new Set(['CDB', 'LCI', 'LCA', 'Fund']);
+
+  function isFixedIncome(assetClass) { return FIXED_INCOME.has(assetClass); }
+
+  function txTotal(tx, assetClass) {
+    if (tx.type === 'buy' || tx.type === 'sell') {
+      if (isFixedIncome(assetClass)) return parseFloat(tx.amount) || 0;
+      return (parseFloat(tx.amount) || 0) * (parseFloat(tx.quantity) || 0);
+    }
+    return parseFloat(tx.amount) || 0;
+  }
+
+  function calcAvgPrice(txs, assetClass) {
+    const buys = txs.filter(t => t.type === 'buy');
+    if (!buys.length) return 0;
+    if (isFixedIncome(assetClass)) {
+      const totalAmt = buys.reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+      const totalQty = buys.reduce((s, t) => s + (parseFloat(t.quantity) || 1), 0);
+      return totalQty ? totalAmt / totalQty : 0;
+    } else {
+      const totalCost = buys.reduce((s, t) => s + (parseFloat(t.amount) || 0) * (parseFloat(t.quantity) || 0), 0);
+      const totalQty = buys.reduce((s, t) => s + (parseFloat(t.quantity) || 0), 0);
+      return totalQty ? totalCost / totalQty : 0;
+    }
+  }
+
+  function calcQty(txs) {
+    return txs.filter(t => t.type === 'buy' || t.type === 'sell').reduce((s, t) => {
+      const q = parseFloat(t.quantity) || 0;
+      return t.type === 'buy' ? s + q : s - q;
+    }, 0);
+  }
+
+  function calcTotalCost(txs, assetClass) {
+    const buys = txs.filter(t => t.type === 'buy');
+    if (isFixedIncome(assetClass)) {
+      return buys.reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+    } else {
+      return buys.reduce((s, t) => s + (parseFloat(t.amount) || 0) * (parseFloat(t.quantity) || 0), 0);
+    }
+  }
+
+  // Para fundos/renda fixa: capital líquido investido = Σ(buys) − Σ(sells)
+  function calcNetInvested(txs) {
+    const totalBuys  = txs.filter(t => t.type === 'buy' ).reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+    const totalSells = txs.filter(t => t.type === 'sell').reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+    return totalBuys - totalSells;
+  }
+
+  function calcPosition(asset, qty) {
+    const price = parseFloat(asset.manualUnitPrice) || 0;
+    if (isFixedIncome(asset.assetClass)) return price;
+    return price * qty;
+  }
+
+  function calcPL(asset, avgPriceOrNet, qty) {
+    const price = parseFloat(asset.manualUnitPrice) || 0;
+    if (isFixedIncome(asset.assetClass)) {
+      // avgPriceOrNet é netInvested para renda fixa/fundos
+      return price - avgPriceOrNet;
+    } else {
+      return (price - avgPriceOrNet) * qty;
+    }
+  }
+
+  function calcPortfolioTotal(assets) {
+    return assets.reduce((s, asset) => {
+      const txs = getTxs().filter(t => t.assetId === asset.id);
+      const qty = calcQty(txs);
+      return s + calcPosition(asset, qty);
+    }, 0);
+  }
+
+  // ── 5. STATE ─────────────────────────────────────────────────────────────
+  let state = {
+    from: '', to: '', assetId: '', search: '', typeFilter: 'all',
+    view: localStorage.getItem(VIEW_KEY) || 'table',
+    showAssets: true,
+    confirmDelete: null,   // { txId }
+    modal: null            // { type: 'newAsset'|'addTx'|'editTx', data: {} }
+  };
+
+  // dirty / justSaved per asset id
+  const editState = {}; // { [assetId]: { raw: string, dirty: bool, justSaved: bool } }
+
+  // ── 6. BADGE / TYPE HELPERS ──────────────────────────────────────────────
+  function badgeInfo(tx, assetClass) {
+    if (tx.type === 'buy') return { cls: 'nx-badge-buy', dot: 'var(--buy)', label: 'Buy' };
+    if (tx.type === 'sell') return { cls: 'nx-badge-sell', dot: 'var(--sell)', label: 'Sell' };
+    if (tx.type === 'adjustment') return { cls: 'nx-badge-adj', dot: 'var(--adj)', label: 'Adj' };
+    if (tx.type === 'income') {
+      if (assetClass === 'Fund') return { cls: 'nx-badge-div', dot: 'var(--div)', label: 'Dividend' };
+      return { cls: 'nx-badge-coup', dot: 'var(--coup)', label: 'Coupon' };
+    }
+    return { cls: 'nx-badge-adj', dot: 'var(--adj)', label: tx.type };
+  }
+
+  function totalClass(type) {
+    if (type === 'buy') return 'nx-total-buy';
+    if (type === 'sell') return 'nx-total-sell';
+    if (type === 'income') return 'nx-total-income';
+    return 'nx-total-adj';
+  }
+
+  function totalSign(type) {
+    if (type === 'buy') return '−';
+    if (type === 'sell') return '+';
+    if (type === 'income') return '+';
+    return '±';
+  }
+
+  // ── 7. RENDER ─────────────────────────────────────────────────────────────
+  let _container = null;
+
+  function renderPage() {
+    if (!_container) return;
+    const assets = getAssets();
+    const allTxs = getTxs();
+    const portfolioTotal = calcPortfolioTotal(assets);
+    _container.innerHTML = renderHeader(assets, portfolioTotal) +
+      renderFilters(assets) +
+      renderAssetsSection(assets, allTxs, portfolioTotal) +
+      renderTransactionsSection(assets, allTxs) +
+      renderModal(assets) +
+      renderConfirmModal();
+    attachEventListeners();
+  }
+
+  function renderHeader(assets, portfolioTotal) {
+    return `
+      <div class="nx-page-header">
+        <div class="nx-page-header-left">
+          <h1>Investments Transactions</h1>
+          <p>Track your portfolio assets and transaction history</p>
+        </div>
+        <div class="nx-header-btns">
+          <button class="nx-btn nx-btn-outline" data-action="open-new-asset">+ New asset</button>
+          <button class="nx-btn nx-btn-primary" data-action="open-add-tx">+ Add transaction</button>
+        </div>
+      </div>`;
+  }
+
+  function renderFilters(assets) {
+    const s = state;
+    const chips = [
+      { key: 'all', label: 'All types', dot: '#aaa' },
+      { key: 'buy', label: 'Buy', dot: 'var(--buy)' },
+      { key: 'sell', label: 'Sell', dot: 'var(--sell)' },
+      { key: 'income-Fund', label: 'Dividend', dot: 'var(--div)' },
+      { key: 'income', label: 'Coupon', dot: 'var(--coup)' },
+      { key: 'adjustment', label: 'Adjustment', dot: 'var(--adj)' },
+    ];
+    const assetOptions = assets.map(a => `<option value="${escHtml(a.id)}" ${s.assetId === a.id ? 'selected' : ''}>${escHtml(a.name)}${a.ticker ? ' (' + escHtml(a.ticker) + ')' : ''}</option>`).join('');
+    return `
+      <div class="nx-filter-card">
+        <div class="nx-filter-grid">
+          <div class="nx-filter-field">
+            <label>From date</label>
+            <input type="date" data-filter="from" value="${escHtml(s.from)}" />
+          </div>
+          <div class="nx-filter-field">
+            <label>To date</label>
+            <input type="date" data-filter="to" value="${escHtml(s.to)}" />
+          </div>
+          <div class="nx-filter-field">
+            <label>Asset</label>
+            <select data-filter="assetId">
+              <option value="">All assets</option>
+              ${assetOptions}
+            </select>
+          </div>
+          <div class="nx-filter-field">
+            <label>Search</label>
+            <input type="text" data-filter="search" value="${escHtml(s.search)}" placeholder="Ticker or note…" />
+          </div>
+        </div>
+        <div class="nx-chips">
+          ${chips.map(c => `<span class="nx-chip ${s.typeFilter === c.key ? 'nx-chip-active' : ''}" data-action="type-filter" data-val="${escHtml(c.key)}"><span class="nx-chip-dot" style="background:${c.dot}"></span>${escHtml(c.label)}</span>`).join('')}
+          <button class="nx-clear-btn" data-action="clear-filters">Clear all</button>
+        </div>
+      </div>`;
+  }
+
+  function renderAssetsSection(assets, allTxs, portfolioTotal) {
+    const totalFmt = 'R$ ' + fmtBR(portfolioTotal);
+    const pill = `${assets.length} asset${assets.length !== 1 ? 's' : ''} · ${totalFmt}`;
+    const arrow = state.showAssets ? '▲' : '▼';
+    let body = '';
+    if (state.showAssets) {
+      if (!assets.length) {
+        body = `<div class="nx-empty"><div class="nx-empty-icon">📊</div><h3>No assets yet</h3><p>Add your first investment asset to start tracking.</p><button class="nx-btn nx-btn-primary" data-action="open-new-asset">+ New asset</button></div>`;
+      } else {
+        body = `<div class="nx-asset-grid">${assets.map(a => renderAssetCard(a, allTxs.filter(t => t.assetId === a.id), portfolioTotal)).join('')}</div>`;
+      }
+    }
+    return `
+      <div class="nx-section">
+        <div class="nx-section-header">
+          <h2 class="nx-section-title">Assets</h2>
+          <span class="nx-pill">${escHtml(pill)}</span>
+          <button class="nx-collapse-btn" data-action="toggle-assets">${arrow}</button>
+        </div>
+        ${body}
+      </div>`;
+  }
+
+  function renderAssetCard(asset, txs, portfolioTotal) {
+    const fi = isFixedIncome(asset.assetClass);
+    const qty = calcQty(txs);
+    const txCount = txs.filter(t => t.type === 'buy' || t.type === 'sell').length;
+
+    // Para fundos/renda fixa: usa capital líquido investido
+    // Para ETFs: usa preço médio ponderado por cota
+    const netInvested = fi ? calcNetInvested(txs) : 0;
+    const avgPrice    = fi ? 0 : calcAvgPrice(txs, asset.assetClass);
+
+    // Renda fixa com cupons: inclui os rendimentos recebidos no Total P/L
+    const totalIncome = fi
+      ? txs.filter(t => t.type === 'income').reduce((s, t) => s + (parseFloat(t.amount) || 0), 0)
+      : 0;
+
+    const position  = calcPosition(asset, qty);
+
+    // Para fi: Total P/L = (valor atual − capital líquido) + rendimentos recebidos
+    // Para ETF: Unrealized P/L = (preço atual − preço médio) × qtd
+    const unrealizedPL = fi
+      ? calcPL(asset, netInvested, qty)
+      : calcPL(asset, avgPrice, qty);
+    const pl = fi ? unrealizedPL + totalIncome : unrealizedPL;
+
+    const plBase    = fi ? netInvested : calcTotalCost(txs, asset.assetClass);
+    const plPct     = plBase ? (pl / plBase * 100) : 0;
+    const allocation = portfolioTotal ? (position / portfolioTotal * 100) : 0;
+    const totalCost = fi ? netInvested : calcTotalCost(txs, asset.assetClass);
+
+    // Label: "Total P/L" para fi (inclui cupons), "Unrealized P/L" para ETF
+    const plLabel = fi ? 'Total P/L' : 'Unrealized P/L';
+    // Subtítulo extra para fi: mostra quanto veio de rendimentos
+    const plSub = (fi && totalIncome > 0)
+      ? `incl. R$ ${fmtBR(totalIncome)} income`
+      : '';
+
+    const plCls  = pl >= 0 ? 'nx-stat-buy' : 'nx-stat-sell';
+    const plSign = pl >= 0 ? '+' : '';
+
+    // Editable state
+    const es = editState[asset.id] || (editState[asset.id] = { raw: fmtBR(asset.manualUnitPrice || 0), dirty: false, justSaved: false });
+    let subText = '';
+    if (es.dirty) {
+      subText = `<span class="nx-stat-accent">Press Enter or ✓ to save</span>`;
+    } else if (es.justSaved) {
+      subText = `<span class="nx-stat-buy">✓ Saved · recalculated</span>`;
+    } else {
+      const upd = asset.priceUpdatedAt ? 'Last updated · ' + relativeDate(asset.priceUpdatedAt) : 'Not yet updated';
+      subText = `<span>${escHtml(upd)}</span>`;
+    }
+
+    const editLabel = fi ? 'Current total value' : 'Current unit price';
+    const footerLeft = fi
+      ? `Net invested · R$ ${fmtBR(netInvested)}`
+      : `Cost basis · R$ ${fmtBR(totalCost)}`;
+    const footerRight = fi
+      ? 'Editable value = total net position'
+      : 'Editable value = unit price per share';
+
+    // Stat 3: "Capital investido" (fi) ou "Avg unit price" (ETF)
+    const avgLabel = fi ? 'Capital invested' : 'Avg unit price';
+    const avgValue = fi ? fmtBR(netInvested) : fmtBR(avgPrice);
+    const avgSub = fi
+      ? `${txCount} transaction${txCount !== 1 ? 's' : ''}`
+      : `${fmtQty(qty)} shares · ${txCount} tx`;
+
+    const couponBtn = fi ? `<button class="nx-btn nx-btn-outline nx-btn-sm" data-action="open-coupon" data-asset-id="${escHtml(asset.id)}">+ Coupon</button>` : '';
+
+    return `
+      <div class="nx-asset-card" data-asset-id="${escHtml(asset.id)}">
+        <div class="nx-asset-card-header">
+          <div>
+            <div class="nx-asset-card-name">${escHtml(asset.name)}<span class="nx-asset-class-badge">${escHtml(asset.assetClass || '')}</span></div>
+            <div class="nx-asset-card-meta">${asset.ticker ? escHtml(asset.ticker) : ''}${asset.issuer ? ' · ' + escHtml(asset.issuer) : ''}</div>
+          </div>
+          <div class="nx-asset-actions">
+            ${couponBtn}
+          </div>
+        </div>
+        <div class="nx-stats-grid">
+          <div class="nx-stat">
+            <div class="nx-stat-label">${escHtml(editLabel)}</div>
+            <div class="nx-editable-wrap">
+              <div class="nx-editable-input-row">
+                <span class="nx-editable-prefix">R$</span>
+                <input class="nx-editable-input" type="text" data-action="price-input" data-asset-id="${escHtml(asset.id)}" value="${escHtml(es.raw)}" inputmode="decimal" />
+                <button class="nx-editable-confirm" data-action="price-save" data-asset-id="${escHtml(asset.id)}" ${es.dirty ? '' : 'disabled'}>✓</button>
+              </div>
+              <div class="nx-editable-sub">${subText}</div>
+            </div>
+          </div>
+          <div class="nx-stat">
+            <div class="nx-stat-label">Current position</div>
+            <div class="nx-stat-value">R$ ${fmtBR(position)}<span class="nx-alloc-chip">${fmtBR(allocation, 1)}%</span></div>
+            <div class="nx-stat-sub">${fi ? 'Net position' : fmtQty(qty) + ' shares'}</div>
+          </div>
+          <div class="nx-stat">
+            <div class="nx-stat-label">${avgLabel}</div>
+            <div class="nx-stat-value">R$ ${avgValue}</div>
+            <div class="nx-stat-sub">${escHtml(avgSub)}</div>
+          </div>
+          <div class="nx-stat">
+            <div class="nx-stat-label">${escHtml(plLabel)}</div>
+            <div class="nx-stat-value ${plCls}">${plSign}R$ ${fmtBR(Math.abs(pl))}</div>
+            <div class="nx-stat-sub ${plCls}">${plSign}${fmtBR(Math.abs(plPct), 1)}%${plSub ? '<br><span style="font-size:10px;opacity:.8;">' + escHtml(plSub) + '</span>' : ''}</div>
+          </div>
+        </div>
+        <div class="nx-asset-footer">
+          <span class="nx-asset-footer-left">${escHtml(footerLeft)}</span>
+          <span class="nx-asset-footer-right">${escHtml(footerRight)}</span>
+        </div>
+      </div>`;
+  }
+
+  function filterTxs(allTxs, assets) {
+    const s = state;
+    const assetMap = {};
+    assets.forEach(a => { assetMap[a.id] = a; });
+    return allTxs.filter(tx => {
+      if (s.from && tx.date < s.from) return false;
+      if (s.to && tx.date > s.to) return false;
+      if (s.assetId && tx.assetId !== s.assetId) return false;
+      if (s.search) {
+        const q = s.search.toLowerCase();
+        const a = assetMap[tx.assetId];
+        const ticker = (a && a.ticker || '').toLowerCase();
+        const note = (tx.notes || '').toLowerCase();
+        if (!ticker.includes(q) && !note.includes(q)) return false;
+      }
+      if (s.typeFilter !== 'all') {
+        if (s.typeFilter === 'income-Fund') {
+          const a = assetMap[tx.assetId];
+          if (tx.type !== 'income' || !a || a.assetClass !== 'Fund') return false;
+        } else if (s.typeFilter === 'income') {
+          const a = assetMap[tx.assetId];
+          if (tx.type !== 'income' || (a && a.assetClass === 'Fund')) return false;
+        } else {
+          if (tx.type !== s.typeFilter) return false;
+        }
+      }
+      return true;
+    });
+  }
+
+  function renderTransactionsSection(assets, allTxs) {
+    const filtered = filterTxs(allTxs, assets);
+    const count = filtered.length;
+    const isCards = state.view === 'cards';
+    return `
+      <div class="nx-section">
+        <div class="nx-section-header">
+          <h2 class="nx-section-title">Transactions</h2>
+          <span class="nx-pill">${count} transaction${count !== 1 ? 's' : ''}</span>
+          <div class="nx-section-view-toggle">
+            <button class="nx-vt-btn ${!isCards ? 'active' : ''}" data-action="set-view" data-val="table">Table</button>
+            <button class="nx-vt-btn ${isCards ? 'active' : ''}" data-action="set-view" data-val="cards">Cards</button>
+          </div>
+        </div>
+        ${isCards ? renderCardsView(filtered, assets) : renderTableView(filtered, assets)}
+      </div>`;
+  }
+
+  function renderTableView(filtered, assets) {
+    if (!filtered.length) {
+      return `<div class="nx-table-wrap"><div class="nx-table-empty">No transactions match these filters · <a data-action="clear-filters">Clear filters</a></div></div>`;
+    }
+    const assetMap = {};
+    assets.forEach(a => { assetMap[a.id] = a; });
+
+    // group by month descending
+    const groups = {};
+    filtered.forEach(tx => {
+      const k = monthKey(tx.date);
+      if (!groups[k]) groups[k] = [];
+      groups[k].push(tx);
+    });
+    const sortedKeys = Object.keys(groups).sort((a, b) => b.localeCompare(a));
+
+    let html = '<div class="nx-table-wrap">';
+    html += '<table class="nx-table"><thead><tr>' +
+      '<th>Type</th><th>Asset</th><th>Date</th><th>Qty</th><th>Unit price</th><th>Total</th><th>Note</th><th></th>' +
+      '</tr></thead><tbody>';
+
+    sortedKeys.forEach(key => {
+      const txs = groups[key];
+      const sorted = [...txs].sort((a, b) => b.date.localeCompare(a.date));
+      // month net
+      const net = sorted.reduce((s, tx) => {
+        const a = assetMap[tx.assetId];
+        const t = txTotal(tx, a ? a.assetClass : 'ETF');
+        if (tx.type === 'buy') return s - t;
+        if (tx.type === 'sell' || tx.type === 'income') return s + t;
+        return s;
+      }, 0);
+      const netSign = net >= 0 ? '+' : '';
+      const lbl = monthLabel(key + '-01');
+      html += `<tr><td colspan="8" style="padding:0;"><div class="nx-month-header"><span class="nx-month-label">${escHtml(lbl)}</span><span class="nx-month-meta">Net: ${netSign}R$ ${fmtBR(Math.abs(net))} · ${sorted.length} transaction${sorted.length !== 1 ? 's' : ''}</span></div></td></tr>`;
+
+      sorted.forEach(tx => {
+        const asset = assetMap[tx.assetId];
+        const ac = asset ? asset.assetClass : 'ETF';
+        const badge = badgeInfo(tx, ac);
+        const total = txTotal(tx, ac);
+        const totalCls = totalClass(tx.type);
+        const sign = totalSign(tx.type);
+        const unitPrice = (tx.type === 'buy' || tx.type === 'sell') ? 'R$ ' + fmtBR(parseFloat(tx.amount) || 0) : '—';
+        const qty = (tx.type === 'buy' || tx.type === 'sell') ? fmtQty(parseFloat(tx.quantity) || 0) : '—';
+        html += `<tr>
+          <td><span class="nx-type-badge ${badge.cls}"><span class="nx-chip-dot" style="background:${badge.dot}"></span>${escHtml(badge.label)}</span></td>
+          <td><div class="nx-asset-name-cell">${escHtml(asset ? asset.name : tx.assetId)}<div class="nx-asset-ticker-meta">${asset && asset.ticker ? escHtml(asset.ticker) + ' · ' : ''}${escHtml(ac)}</div></div></td>
+          <td><div class="nx-date-main">${fmtDate(tx.date)}</div><div class="nx-date-sub">${txRelativeDate(tx.date)}</div></td>
+          <td>${qty}</td>
+          <td>${unitPrice}</td>
+          <td><span class="${totalCls}">${sign}R$ ${fmtBR(total)}</span></td>
+          <td><span class="nx-note-cell" title="${escHtml(tx.notes || '')}">${escHtml(tx.notes || '')}</span></td>
+          <td><div class="nx-table-actions">
+            <button class="nx-tbl-icon-btn" data-action="edit-tx" data-tx-id="${escHtml(tx.id)}" title="Edit">✏️</button>
+            <button class="nx-tbl-icon-btn nx-danger" data-action="delete-tx" data-tx-id="${escHtml(tx.id)}" title="Delete">🗑️</button>
+          </div></td>
+        </tr>`;
+      });
+    });
+
+    html += '</tbody></table></div>';
+    return html;
+  }
+
+  function renderCardsView(filtered, assets) {
+    if (!filtered.length) {
+      return `<div class="nx-table-wrap"><div class="nx-table-empty">No transactions match these filters · <a data-action="clear-filters">Clear filters</a></div></div>`;
+    }
+    const assetMap = {};
+    assets.forEach(a => { assetMap[a.id] = a; });
+
+    const groups = {};
+    filtered.forEach(tx => {
+      const k = monthKey(tx.date);
+      if (!groups[k]) groups[k] = [];
+      groups[k].push(tx);
+    });
+    const sortedKeys = Object.keys(groups).sort((a, b) => b.localeCompare(a));
+
+    let html = '';
+    sortedKeys.forEach(key => {
+      const txs = [...groups[key]].sort((a, b) => b.date.localeCompare(a.date));
+      const lbl = monthLabel(key + '-01');
+      html += `<div class="nx-month-section">
+        <div class="nx-month-header" style="border-radius:10px;margin-bottom:10px;"><span class="nx-month-label">${escHtml(lbl)}</span><span class="nx-month-meta">${txs.length} transaction${txs.length !== 1 ? 's' : ''}</span></div>
+        <div class="nx-cards-grid">`;
+      txs.forEach(tx => {
+        const asset = assetMap[tx.assetId];
+        const ac = asset ? asset.assetClass : 'ETF';
+        const badge = badgeInfo(tx, ac);
+        const total = txTotal(tx, ac);
+        const sign = totalSign(tx.type);
+        html += `<div class="nx-tx-card">
+          <div class="nx-tx-card-header">
+            <span class="nx-type-badge ${badge.cls}"><span class="nx-chip-dot" style="background:${badge.dot}"></span>${escHtml(badge.label)}</span>
+            <div style="display:flex;gap:4px;">
+              <button class="nx-tbl-icon-btn" data-action="edit-tx" data-tx-id="${escHtml(tx.id)}" title="Edit">✏️</button>
+              <button class="nx-tbl-icon-btn nx-danger" data-action="delete-tx" data-tx-id="${escHtml(tx.id)}" title="Delete">🗑️</button>
+            </div>
+          </div>
+          <div class="nx-tx-card-field"><div class="nx-tx-card-field-label">Asset</div><div class="nx-tx-card-field-value">${escHtml(asset ? asset.name : tx.assetId)}</div></div>
+          <div class="nx-tx-card-field"><div class="nx-tx-card-field-label">Date</div><div class="nx-tx-card-field-value">${fmtDate(tx.date)} <span style="color:var(--text-secondary,#6b6b6b);font-size:11px;">${txRelativeDate(tx.date)}</span></div></div>
+          ${(tx.type === 'buy' || tx.type === 'sell') ? `<div class="nx-tx-card-field"><div class="nx-tx-card-field-label">Qty</div><div class="nx-tx-card-field-value">${fmtQty(parseFloat(tx.quantity)||0)}</div></div>` : ''}
+          <div class="nx-tx-card-field"><div class="nx-tx-card-field-label">Total</div><div class="nx-tx-card-field-value" style="font-family:'Fraunces',Georgia,serif;font-weight:600;">${sign}R$ ${fmtBR(total)}</div></div>
+          ${tx.notes ? `<div class="nx-tx-card-field"><div class="nx-tx-card-field-label">Note</div><div class="nx-tx-card-field-value" style="font-style:italic;color:var(--text-secondary,#6b6b6b);">${escHtml(tx.notes)}</div></div>` : ''}
+        </div>`;
+      });
+      html += '</div></div>';
+    });
+    return html;
+  }
+
+  // ── 8. MODALS ─────────────────────────────────────────────────────────────
+  function renderModal(assets) {
+    const m = state.modal;
+    if (!m) return '';
+    if (m.type === 'newAsset') return renderNewAssetModal();
+    if (m.type === 'addTx' || m.type === 'editTx' || m.type === 'coupon') return renderTxModal(assets, m);
+    return '';
+  }
+
+  function renderNewAssetModal() {
+    const d = state.modal.data || {};
+    return `
+      <div class="nx-modal-overlay" data-action="modal-overlay-close">
+        <div class="nx-modal">
+          <div class="nx-modal-title">New Asset</div>
+          <div class="nx-modal-field"><label>Name *</label><input type="text" id="nm-name" value="${escHtml(d.name||'')}" placeholder="e.g. iShares S&P 500" /></div>
+          <div class="nx-modal-field"><label>Ticker</label><input type="text" id="nm-ticker" value="${escHtml(d.ticker||'')}" placeholder="e.g. IVVB11" /></div>
+          <div class="nx-modal-field"><label>Asset class *</label>
+            <select id="nm-class">
+              ${['ETF','Fund','CDB','LCI','LCA','Cash'].map(c => `<option value="${c}" ${(d.assetClass||'ETF')===c?'selected':''}>${c}</option>`).join('')}
+            </select>
+          </div>
+          <div id="nm-fi-fields" style="${isFixedIncome(d.assetClass||'ETF')?'':'display:none'}">
+            <div class="nx-modal-field"><label>Issuer</label><input type="text" id="nm-issuer" value="${escHtml(d.issuer||'')}" placeholder="e.g. Banco XYZ" /></div>
+            <div class="nx-modal-field"><label>Maturity date</label><input type="date" id="nm-maturity" value="${escHtml(d.maturityDate||'')}" /></div>
+          </div>
+          <div class="nx-modal-field"><label>Notes</label><textarea id="nm-notes" rows="2" placeholder="Optional…">${escHtml(d.notes||'')}</textarea></div>
+          <div class="nx-modal-footer">
+            <button class="nx-btn nx-btn-ghost" data-action="modal-close">Cancel</button>
+            <button class="nx-btn nx-btn-primary" data-action="save-new-asset">Save asset</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function renderTxModal(assets, m) {
+    const d = m.data || {};
+    const isEdit = m.type === 'editTx';
+    const title = isEdit ? 'Edit transaction' : 'Add transaction';
+    const ac = assets.find(a => a.id === (d.assetId||''));
+    const fi = ac ? isFixedIncome(ac.assetClass) : false;
+    return `
+      <div class="nx-modal-overlay" data-action="modal-overlay-close">
+        <div class="nx-modal">
+          <div class="nx-modal-title">${escHtml(title)}</div>
+          <div class="nx-modal-field"><label>Asset *</label>
+            <select id="tm-asset" ${m.type === 'coupon' ? 'disabled' : ''}>
+              <option value="">Select asset…</option>
+              ${assets.map(a => `<option value="${escHtml(a.id)}" ${d.assetId===a.id?'selected':''}>${escHtml(a.name)}${a.ticker?' ('+a.ticker+')':''}</option>`).join('')}
+            </select>
+          </div>
+          <div class="nx-modal-field"><label>Type *</label>
+            <select id="tm-type" ${m.type === 'coupon' ? 'disabled' : ''}>
+              ${['buy','sell','income','adjustment'].map(t => `<option value="${t}" ${(d.type||'buy')===t?'selected':''}>${t}</option>`).join('')}
+            </select>
+          </div>
+          <div class="nx-modal-field"><label>Date *</label><input type="date" id="tm-date" value="${escHtml(d.date||new Date().toISOString().slice(0,10))}" /></div>
+          <div id="tm-qty-wrap" class="nx-modal-field" style="${fi?'display:none':''}"><label>Quantity</label><input type="number" id="tm-qty" value="${escHtml(d.quantity||'')}" placeholder="0" step="any" min="0" /></div>
+          <div class="nx-modal-field">
+            <label id="tm-amount-label">${fi ? 'Total amount (R$)' : 'Unit price (R$)'} *</label>
+            <div style="display:flex;align-items:center;gap:6px;border:1.5px solid var(--border,#e8e8e8);border-radius:8px;padding:0 10px;background:var(--input-bg,#fafafa);">
+              <span style="font-size:13px;color:var(--text-secondary,#6b7280);flex-shrink:0;">R$</span>
+              <input type="text" id="tm-amount" class="nx-modal-money-input"
+                inputmode="decimal" autocomplete="off"
+                value="${d.amount ? parseBR(d.amount).toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2}) : '0,00'}"
+                placeholder="0,00"
+                style="border:none;background:transparent;outline:none;font-size:14px;width:100%;padding:10px 0;color:var(--text,#1a1a1a);" />
+            </div>
+          </div>
+          <div class="nx-modal-field"><label>Notes</label><textarea id="tm-notes" rows="2" placeholder="Optional…">${escHtml(d.notes||'')}</textarea></div>
+          <div id="tm-save-error" style="display:none;color:var(--sell,#C25450);font-size:13px;margin-bottom:8px;"></div>
+          <div class="nx-modal-footer">
+            <button class="nx-btn nx-btn-ghost" data-action="modal-close">Cancel</button>
+            <button class="nx-btn nx-btn-primary" data-action="save-tx" ${isEdit ? `data-tx-id="${escHtml(d.id||'')}"` : ''}>Save</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function renderConfirmModal() {
+    if (!state.confirmDelete) return '';
+    return `
+      <div class="nx-modal-overlay" data-action="modal-overlay-close">
+        <div class="nx-confirm-modal">
+          <p>Delete this transaction? This action cannot be undone.</p>
+          <div class="nx-modal-footer">
+            <button class="nx-btn nx-btn-ghost nx-btn-sm" data-action="cancel-delete">Cancel</button>
+            <button class="nx-btn nx-btn-danger nx-btn-sm" data-action="confirm-delete" data-tx-id="${escHtml(state.confirmDelete.txId)}">Delete</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  // ── 9. EVENT HANDLERS ─────────────────────────────────────────────────────
+  function attachEventListeners() {
+    if (!_container) return;
+
+    // Delegated click — remove antes de adicionar para evitar acúmulo entre re-renders
+    _container.removeEventListener('click', handleClick);
+    _container.addEventListener('click', handleClick);
+
+    // Filter inputs (change + input)
+    _container.querySelectorAll('[data-filter]').forEach(el => {
+      el.addEventListener('change', handleFilterChange);
+      el.addEventListener('input', handleFilterChange);
+    });
+
+    // Price inputs (keydown for Enter, input for dirty)
+    _container.querySelectorAll('.nx-editable-input').forEach(el => {
+      el.addEventListener('input', handlePriceInput);
+      el.addEventListener('keydown', handlePriceKeydown);
+      // Ao focar, seleciona tudo: o primeiro dígito digitado substitui o valor anterior,
+      // garantindo que o input calculadora comece do zero.
+      el.addEventListener('focus', () => el.select());
+    });
+
+    // Asset class change in new asset modal to show/hide fi fields
+    const nmClass = _container.querySelector('#nm-class');
+    if (nmClass) {
+      nmClass.addEventListener('change', () => {
+        const fiFields = _container.querySelector('#nm-fi-fields');
+        if (fiFields) fiFields.style.display = isFixedIncome(nmClass.value) ? '' : 'none';
+      });
+    }
+
+    // Modal amount input — formato calculadora (igual ao campo de preço dos asset cards)
+    const tmAmount = _container.querySelector('#tm-amount');
+    if (tmAmount) {
+      tmAmount.addEventListener('input', function () {
+        const digits = tmAmount.value.replace(/\D/g, '');
+        const cents = parseInt(digits || '0', 10);
+        const fmt = (cents / 100).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        tmAmount.value = fmt;
+        tmAmount.setSelectionRange(fmt.length, fmt.length);
+        // Limpa erro se existir
+        const errEl = _container.querySelector('#tm-save-error');
+        if (errEl) errEl.style.display = 'none';
+      });
+      tmAmount.addEventListener('focus', function () { tmAmount.select(); });
+    }
+
+    // Asset select change in tx modal to show/hide qty
+    const tmAsset = _container.querySelector('#tm-asset');
+    if (tmAsset) {
+      tmAsset.addEventListener('change', () => {
+        const assets = getAssets();
+        const asset = assets.find(a => a.id === tmAsset.value);
+        const fi = asset ? isFixedIncome(asset.assetClass) : false;
+        const qtyWrap = _container.querySelector('#tm-qty-wrap');
+        if (qtyWrap) qtyWrap.style.display = fi ? 'none' : '';
+      });
+    }
+  }
+
+  function handleClick(e) {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    const action = btn.dataset.action;
+
+    if (action === 'open-new-asset') { state.modal = { type: 'newAsset', data: {} }; renderPage(); return; }
+    if (action === 'open-add-tx') { state.modal = { type: 'addTx', data: {} }; renderPage(); return; }
+    if (action === 'open-coupon') {
+      const assetId = btn.dataset.assetId;
+      state.modal = { type: 'coupon', data: { assetId, type: 'income' } };
+      renderPage(); return;
+    }
+    if (action === 'modal-close') { state.modal = null; renderPage(); return; }
+    // modal-overlay-close: fecha apenas se o clique foi direto no overlay (não em conteúdo interno)
+    if (action === 'modal-overlay-close') { if (e.target === btn) { state.modal = null; renderPage(); } return; }
+    if (action === 'toggle-assets') { state.showAssets = !state.showAssets; renderPage(); return; }
+    if (action === 'type-filter') { state.typeFilter = btn.dataset.val; renderPage(); return; }
+    if (action === 'set-view') {
+      state.view = btn.dataset.val;
+      localStorage.setItem(VIEW_KEY, state.view);
+      renderPage(); return;
+    }
+    if (action === 'clear-filters') {
+      state.from = ''; state.to = ''; state.assetId = ''; state.search = ''; state.typeFilter = 'all';
+      renderPage(); return;
+    }
+    if (action === 'price-save') {
+      const assetId = btn.dataset.assetId;
+      savePriceForAsset(assetId);
+      return;
+    }
+    if (action === 'save-new-asset') { doSaveNewAsset(); return; }
+    if (action === 'save-tx') { doSaveTx(btn.dataset.txId); return; }
+    if (action === 'edit-tx') {
+      const txId = btn.dataset.txId;
+      const tx = getTxs().find(t => t.id === txId);
+      if (tx) { state.modal = { type: 'editTx', data: { ...tx } }; renderPage(); }
+      return;
+    }
+    if (action === 'delete-tx') {
+      state.confirmDelete = { txId: btn.dataset.txId };
+      renderPage(); return;
+    }
+    if (action === 'cancel-delete') { state.confirmDelete = null; renderPage(); return; }
+    if (action === 'confirm-delete') {
+      const txId = btn.dataset.txId;
+      const txs = getTxs().filter(t => t.id !== txId);
+      saveTxs(txs);
+      state.confirmDelete = null;
+      renderPage(); return;
+    }
+  }
+
+  function handleFilterChange(e) {
+    const el = e.target;
+    const key = el.dataset.filter;
+    if (key) { state[key] = el.value; renderPage(); }
+  }
+
+  function handlePriceInput(e) {
+    const el = e.target;
+    const assetId = el.dataset.assetId;
+    if (!assetId) return;
+
+    // Formato calculadora: extrai só os dígitos, trata como centavos e shifta pra esquerda.
+    // Ex.: digitar "1","2","3","4","5" → "0,01" → "0,12" → "1,23" → "12,34" → "123,45"
+    const digits = el.value.replace(/\D/g, '');
+    const cents = parseInt(digits || '0', 10);
+    const formatted = (cents / 100).toLocaleString('pt-BR', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    });
+    // Atualiza o valor exibido e reposiciona o cursor no fim
+    el.value = formatted;
+    el.setSelectionRange(formatted.length, formatted.length);
+
+    if (!editState[assetId]) editState[assetId] = { raw: formatted, dirty: false, justSaved: false };
+    editState[assetId].raw = formatted;
+    editState[assetId].dirty = true;
+    editState[assetId].justSaved = false;
+
+    const confirmBtn = _container.querySelector(`.nx-editable-confirm[data-asset-id="${assetId}"]`);
+    if (confirmBtn) confirmBtn.disabled = false;
+    const subEl = el.closest('.nx-editable-wrap') && el.closest('.nx-editable-wrap').querySelector('.nx-editable-sub');
+    if (subEl) subEl.innerHTML = `<span class="nx-stat-accent">Press Enter or ✓ to save</span>`;
+  }
+
+  function handlePriceKeydown(e) {
+    if (e.key === 'Enter') {
+      const assetId = e.target.dataset.assetId;
+      if (assetId) savePriceForAsset(assetId);
+    }
+  }
+
+  function savePriceForAsset(assetId) {
+    const es = editState[assetId];
+    if (!es) return;
+    const raw = es.raw;
+    const val = parseBR(raw);
+    if (isNaN(val) || val < 0) return;
+    const assets = getAssets();
+    const asset = assets.find(a => a.id === assetId);
+    if (!asset) return;
+    asset.manualUnitPrice = val;
+    asset.priceUpdatedAt = new Date().toISOString();
+    saveAsset(asset);
+    editState[assetId].dirty = false;
+    editState[assetId].justSaved = true;
+    editState[assetId].raw = fmtBR(val);
+    renderPage();
+    // clear justSaved after 2s
+    setTimeout(() => {
+      if (editState[assetId]) {
+        editState[assetId].justSaved = false;
+        renderPage();
+      }
+    }, 2000);
+  }
+
+  function doSaveNewAsset() {
+    const name = (_container.querySelector('#nm-name') || {}).value || '';
+    const ticker = (_container.querySelector('#nm-ticker') || {}).value || '';
+    const assetClass = (_container.querySelector('#nm-class') || {}).value || 'ETF';
+    const issuer = (_container.querySelector('#nm-issuer') || {}).value || '';
+    const maturityDate = (_container.querySelector('#nm-maturity') || {}).value || '';
+    const notes = (_container.querySelector('#nm-notes') || {}).value || '';
+    if (!name.trim()) { alert('Name is required.'); return; }
+    const asset = { id: generateId(), name: name.trim(), ticker: ticker.trim(), assetClass, issuer, maturityDate, notes, manualUnitPrice: 0, priceUpdatedAt: '' };
+    saveAsset(asset);
+    state.modal = null;
+    renderPage();
+  }
+
+  function doSaveTx(existingId) {
+    const assetId = (_container.querySelector('#tm-asset') || {}).value || '';
+    const type = (_container.querySelector('#tm-type') || {}).value || 'buy';
+    const date = (_container.querySelector('#tm-date') || {}).value || '';
+    const quantity = (_container.querySelector('#tm-qty') || {}).value || '1';
+    const amount = (_container.querySelector('#tm-amount') || {}).value || '';
+    const notes = (_container.querySelector('#tm-notes') || {}).value || '';
+    if (!assetId || !date || !amount) {
+      // Mostra erro inline em vez de alert()
+      const errEl = _container && _container.querySelector('#tm-save-error');
+      if (errEl) { errEl.textContent = 'Asset, date and amount are required.'; errEl.style.display = 'block'; }
+      return;
+    }
+    const parsedAmount = parseBR(amount); // suporta "1.234,56", "1234,56" e "1234.56"
+    const txs = getTxs();
+    if (existingId) {
+      const idx = txs.findIndex(t => t.id === existingId);
+      if (idx >= 0) txs[idx] = { ...txs[idx], assetId, type, date, quantity: parseFloat(quantity)||1, amount: parsedAmount, notes };
+    } else {
+      txs.push({ id: generateId(), assetId, type, date, quantity: parseFloat(quantity)||1, amount: parsedAmount, notes });
+    }
+    saveTxs(txs);
+    state.modal = null;
+    renderPage();
+  }
+
+  // ── 10. MOUNT / UNMOUNT / DETECT ──────────────────────────────────────────
+  let _mounted = false;
+
+  function getActiveNavLabel() {
+    const btn = document.querySelector('.sidebar button.nav-item.active');
+    if (!btn) return '';
+    let lbl = '';
+    btn.childNodes.forEach(n => { if (n.nodeType === 3) lbl += n.textContent.trim(); });
+    return lbl;
+  }
+
+  function isInvestmentTransactions() {
+    return /investment.*trans|trans.*invest/i.test(getActiveNavLabel());
+  }
+
+  function mount() {
+    if (_mounted) return;
+    injectCSS();
+    const main = document.querySelector('.main');
+    if (!main) return;
+    Array.from(main.children).forEach(el => { el.dataset.nxHidden = '1'; el.style.display = 'none'; });
+    _container = document.createElement('div');
+    _container.id = 'nx-it-root';
+    main.appendChild(_container);
+    _mounted = true;
+    // Carrega dados frescos do Gist antes do primeiro render
+    loadFromGist().finally(() => { if (_mounted) renderPage(); });
+  }
+
+  function unmount() {
+    if (!_mounted) return;
+    if (_container) { _container.remove(); _container = null; }
+    const main = document.querySelector('.main');
+    if (main) Array.from(main.children).forEach(el => {
+      if (el.dataset.nxHidden) { el.style.display = ''; delete el.dataset.nxHidden; }
+    });
+    _mounted = false;
+  }
+
+  let _lastActive = false;
+  new MutationObserver(() => {
+    const now = isInvestmentTransactions();
+    if (now === _lastActive) return;
+    _lastActive = now;
+    now ? mount() : unmount();
+  }).observe(document.body, { subtree: true, attributes: true, attributeFilter: ['class'] });
+
+  setTimeout(() => {
+    _lastActive = isInvestmentTransactions();
+    if (_lastActive) mount();
+  }, 600);
+
+})();
+</script>
+
+  <script>
+/* ── Nexo — Nav Patches (icon + order) ──────────────────────────────────── */
+(function () {
+  'use strict';
+
+  var INVEST_TX_ICON =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+    'stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>' +
+    '<polyline points="14 2 14 8 20 8"/>' +
+    '<polyline points="8 17 10 14 13 16 16 12"/>' +
+    '</svg>';
+
+  function itemLabel(btn) {
+    var lbl = '';
+    btn.childNodes.forEach(function (n) {
+      if (n.nodeType === 3) lbl += n.textContent.trim();
+    });
+    return lbl.toLowerCase();
+  }
+
+  var _iconDone  = false;
+  var _orderDone = false;
+
+  function patch() {
+    var btns = Array.from(document.querySelectorAll('.sidebar button.nav-item'));
+    if (!btns.length) return false;
+
+    if (!_iconDone) {
+      btns.forEach(function (btn) {
+        if (/investment.*trans|trans.*invest/i.test(itemLabel(btn))) {
+          var oldSvg = btn.querySelector('svg');
+          if (oldSvg) {
+            var tmp = document.createElement('span');
+            tmp.innerHTML = INVEST_TX_ICON;
+            oldSvg.parentNode.replaceChild(tmp.firstChild, oldSvg);
+            _iconDone = true;
+          }
+        }
+      });
+    }
+
+    if (!_orderDone) {
+      var compound = btns.find(function (b) { return /compound/i.test(itemLabel(b)); });
+      var reports  = btns.find(function (b) { return /report/i.test(itemLabel(b)); });
+
+      if (compound && reports) {
+        reports.parentNode.insertBefore(compound, reports.nextSibling);
+        _orderDone = true;
+      }
+    }
+
+    return _iconDone && _orderDone;
+  }
+
+  var _n = 0;
+  var _iv = setInterval(function () { if (patch() || ++_n > 60) clearInterval(_iv); }, 200);
+})();
+
+/* ── Nexo — Filter Total ─────────────────────────────────────────────────── */
+(function () {
+  'use strict';
+
+  /* Estilos do card de total */
+  var s = document.createElement('style');
+  s.textContent =
+    '#nx-total{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;' +
+    'background:var(--surface,#fff);border:1px solid var(--border,#e5e7eb);' +
+    'border-radius:10px;padding:14px 20px;margin-bottom:16px;' +
+    'box-shadow:var(--shadow-sm,0 1px 3px rgba(0,0,0,.06));}' +
+    '#nx-total .nx-t-label{font-size:13px;font-weight:600;color:var(--text-secondary,#6b7280);' +
+    'text-transform:uppercase;letter-spacing:.5px;}' +
+    '#nx-total .nx-t-right{display:flex;flex-direction:column;align-items:flex-end;gap:2px;}' +
+    '#nx-total .nx-t-val{font-size:20px;font-weight:700;color:var(--accent,#E07A5F);letter-spacing:-.4px;}' +
+    '#nx-total .nx-t-val.positive{color:#22c55e;}' +
+    '#nx-total .nx-t-count{font-size:12px;color:var(--text-secondary,#6b7280);}';
+  document.head.appendChild(s);
+
+  /* Parseia valor brasileiro: "−R$ 1.234,56" → -1234.56 */
+  function parseBRL(text) {
+    var neg = /[−\-]/.test(text.trim().charAt(0)) || text.indexOf('−') > -1;
+    var num = text.replace(/[^0-9,]/g, '').replace(',', '.');
+    var val = parseFloat(num) || 0;
+    return neg ? -val : val;
+  }
+
+  /* Formata número como BRL */
+  function fmtBRL(v) {
+    var abs = Math.abs(v).toFixed(2);
+    var parts = abs.split('.');
+    parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+    return (v < 0 ? '−' : '+') + 'R$ ' + parts[0] + ',' + parts[1];
+  }
+
+  var _el = null;
+  var _lastKey = '';
+
+  function recalc() {
+    var rows = document.querySelectorAll('.expense-row');
+    /* Só mostra quando há linhas E estamos na página de Expenses */
+    var pageTitle = document.querySelector('.page-title');
+    if (!rows.length || !pageTitle || !/expense/i.test(pageTitle.textContent)) {
+      if (_el) _el.style.display = 'none';
+      return;
+    }
+
+    var total = 0, count = 0;
+    rows.forEach(function (row) {
+      /* Pega o último elemento de texto que contenha R$ */
+      var candidates = Array.from(row.querySelectorAll('*')).filter(function (n) {
+        return !n.children.length && /R\$/.test(n.textContent);
+      });
+      if (!candidates.length) return;
+      var amtEl = candidates[candidates.length - 1];
+      total += parseBRL(amtEl.textContent);
+      count++;
+    });
+
+    var key = total.toFixed(2) + ':' + count;
+    if (key === _lastKey) return; /* sem mudança, não reescreve DOM */
+    _lastKey = key;
+
+    /* Cria o card na primeira vez */
+    if (!_el) {
+      _el = document.createElement('div');
+      _el.id = 'nx-total';
+      _el.innerHTML =
+        '<span class="nx-t-label">Total filtrado</span>' +
+        '<div class="nx-t-right">' +
+        '<span class="nx-t-val" id="nx-t-val"></span>' +
+        '<span class="nx-t-count" id="nx-t-cnt"></span>' +
+        '</div>';
+    }
+
+    /* Insere antes do card de expenses (procura o pai das expense-rows) */
+    var listCard = rows[0].closest('.card');
+    if (listCard && !listCard.contains(_el)) {
+      listCard.parentElement.insertBefore(_el, listCard);
+    }
+
+    _el.style.display = '';
+    var valEl = document.getElementById('nx-t-val');
+    var cntEl = document.getElementById('nx-t-cnt');
+    if (valEl) {
+      valEl.textContent = fmtBRL(total);
+      valEl.className = 'nx-t-val' + (total >= 0 ? ' positive' : '');
+    }
+    if (cntEl) cntEl.textContent = count + (count === 1 ? ' transação' : ' transações');
+  }
+
+  /* Observer com debounce — seguro contra loops */
+  var _timer = null;
+  new MutationObserver(function () {
+    clearTimeout(_timer);
+    _timer = setTimeout(recalc, 120);
+  }).observe(document.body, { childList: true, subtree: true });
+
+  setTimeout(recalc, 800);
+})();
+  </script>
+
+  <script>
 /* ── Nexo 2.0 — Mobile Header (loop-safe) ───────────────────────────────── */
 (function () {
   'use strict';
