@@ -2945,6 +2945,59 @@ select.form-input { cursor: pointer; }
     { max: 999, name: 'Very Aggressive',   color: '#7A3F8F' }
   ];
 
+  // ── Gist sync (shared with the rest of the React app via /api/sync/data) ──
+  async function loadNiFromGist() {
+    try {
+      const resp = await fetch('/api/sync/data');
+      if (!resp.ok) return;
+      const json = await resp.json();
+      const d = json && json.payload && json.payload.data;
+      if (!d) return;
+      if (d.targetStrategy && typeof d.targetStrategy === 'object')
+        localStorage.setItem(STRATEGY_KEY, JSON.stringify(d.targetStrategy));
+      if (d.assetRegionMap && typeof d.assetRegionMap === 'object')
+        localStorage.setItem(REGION_MAP_KEY, JSON.stringify(d.assetRegionMap));
+      if (typeof d.niLastAmount === 'number')
+        localStorage.setItem(LAST_AMT_KEY, String(d.niLastAmount));
+      if (d.beaSettings && typeof d.beaSettings === 'object')
+        localStorage.setItem('nexo_bea_settings', JSON.stringify(d.beaSettings));
+      if (d.ibovComposition && Array.isArray(d.ibovComposition.stocks))
+        localStorage.setItem('nexo_ibov_composition', JSON.stringify(d.ibovComposition));
+    } catch (e) {
+      console.warn('[Nexo NI] loadFromGist failed:', e);
+    }
+  }
+
+  var _niSyncTimer = null;
+  function syncNiToGistDebounced() {
+    if (_niSyncTimer) clearTimeout(_niSyncTimer);
+    _niSyncTimer = setTimeout(syncNiToGist, 600);
+  }
+  async function syncNiToGist() {
+    try {
+      const resp = await fetch('/api/sync/data');
+      if (!resp.ok) return;
+      const json = await resp.json();
+      if (!json || !json.payload) return;
+      const payload = json.payload;
+      if (!payload.data) payload.data = {};
+      payload.data.targetStrategy   = loadStrategy();
+      payload.data.assetRegionMap   = loadRegionMap();
+      payload.data.niLastAmount     = parseFloat(localStorage.getItem(LAST_AMT_KEY) || '0') || 0;
+      payload.data.beaSettings      = loadBEASettings();
+      payload.data.ibovComposition  = loadStoredIbov();   // may be null when no CSV was imported
+      if (!payload.meta) payload.meta = {};
+      payload.meta.updatedAt = new Date().toISOString();
+      await fetch('/api/sync/data', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+    } catch (e) {
+      console.warn('[Nexo NI] syncToGist failed:', e);
+    }
+  }
+
   // ── Helpers ──────────────────────────────────────────────────────────────
   function loadJSON(k, def) {
     try { return JSON.parse(localStorage.getItem(k) || def); }
@@ -2962,9 +3015,9 @@ select.form-input { cursor: pointer; }
       crypto: Number.isFinite(+d.crypto) ? +d.crypto : 5
     };
   }
-  function saveStrategy(s) { saveJSON(STRATEGY_KEY, s); }
+  function saveStrategy(s) { saveJSON(STRATEGY_KEY, s); syncNiToGistDebounced(); }
   function loadRegionMap() { return loadJSON(REGION_MAP_KEY, '{}'); }
-  function saveRegionMap(m) { saveJSON(REGION_MAP_KEY, m); }
+  function saveRegionMap(m) { saveJSON(REGION_MAP_KEY, m); syncNiToGistDebounced(); }
   function isFixedIncome(cls) { return FIXED_INCOME.indexOf(cls) >= 0; }
   function escHtml(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
@@ -3073,8 +3126,8 @@ select.form-input { cursor: pointer; }
     if (!d || !Array.isArray(d.stocks) || d.stocks.length === 0) return null;
     return d;
   }
-  function saveStoredIbov(c) { saveJSON(STORED_IBOV_KEY, c); }
-  function clearStoredIbov() { try { localStorage.removeItem(STORED_IBOV_KEY); } catch (e) {} }
+  function saveStoredIbov(c) { saveJSON(STORED_IBOV_KEY, c); syncNiToGistDebounced(); }
+  function clearStoredIbov() { try { localStorage.removeItem(STORED_IBOV_KEY); } catch (e) {} syncNiToGistDebounced(); }
 
   function getActiveIbovSnapshot() {
     var stored = loadStoredIbov();
@@ -3145,6 +3198,7 @@ select.form-input { cursor: pointer; }
     // Persist only known keys so stale junk (e.g. from older builds) doesn't pile up
     var clean = { numStocks: +s.numStocks || 15, minPerStock: +s.minPerStock || 0, onlyMostLiquid: !!s.onlyMostLiquid };
     saveJSON('nexo_bea_settings', clean);
+    syncNiToGistDebounced();
   }
 
   // Returns { stocks: [...], aliases: { 'PETR3': 'PETR4', ... }, snapshotDate, imported }
@@ -3940,6 +3994,7 @@ select.form-input { cursor: pointer; }
     state.amount = v;
     state.showResult = v > 0;
     localStorage.setItem(LAST_AMT_KEY, String(v));
+    syncNiToGistDebounced();
     renderPage();
     var res = _container.querySelector('.nxni-result');
     if (res) res.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -3959,6 +4014,15 @@ select.form-input { cursor: pointer; }
     _container.id = 'nx-ni-root';
     main.appendChild(_container);
     _mounted = true;
+    // Pull the latest values from the Gist before first paint, then re-render with fresh state.
+    loadNiFromGist().finally(function () {
+      state.strategy    = loadStrategy();
+      state.amount      = parseFloat(localStorage.getItem(LAST_AMT_KEY) || '0') || 0;
+      state.showResult  = state.amount > 0;
+      state.beaSettings = loadBEASettings();
+      if (_mounted) renderPage();
+    });
+    // Render with local data immediately so the UI doesn't blank while the fetch is in flight.
     state.strategy = loadStrategy();
     state.amount = parseFloat(localStorage.getItem(LAST_AMT_KEY) || '0') || 0;
     state.showResult = state.amount > 0;
