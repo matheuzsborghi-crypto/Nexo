@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -581,6 +581,7 @@ select.form-input { cursor: pointer; }
   // ── Class colours ─────────────────────────────────────────────────────────
   const CLASS_COLORS = {
     'ETF':   'var(--accent, #E07A5F)',
+    'Stock': '#8E5A8A',
     'CDB':   '#B58A3B',
     'LCI':   '#6B9E7A',
     'LCA':   '#5C8A6C',
@@ -2238,14 +2239,14 @@ select.form-input { cursor: pointer; }
           <div class="nx-modal-field"><label>Ticker</label><input type="text" id="nm-ticker" value="${escHtml(d.ticker||'')}" placeholder="e.g. IVVB11" /></div>
           <div class="nx-modal-field"><label>Asset class *</label>
             <select id="nm-class">
-              ${['ETF','Fund','CDB','LCI','LCA','Cash'].map(c => `<option value="${c}" ${(d.assetClass||'ETF')===c?'selected':''}>${c}</option>`).join('')}
+              ${['ETF','Stock','Fund','CDB','LCI','LCA','Cash'].map(c => `<option value="${c}" ${(d.assetClass||'ETF')===c?'selected':''}>${c}</option>`).join('')}
             </select>
           </div>
           <div id="nm-fi-fields" style="${isFixedIncome(d.assetClass||'ETF')?'':'display:none'}">
             <div class="nx-modal-field"><label>Issuer</label><input type="text" id="nm-issuer" value="${escHtml(d.issuer||'')}" placeholder="e.g. Banco XYZ" /></div>
             <div class="nx-modal-field"><label>Maturity date</label><input type="date" id="nm-maturity" value="${escHtml(d.maturityDate||'')}" /></div>
           </div>
-          <div id="nm-region-fields" style="${(['ETF','Fund'].indexOf(d.assetClass||'ETF')>=0)?'':'display:none'}">
+          <div id="nm-region-fields" style="${(['ETF','Stock','Fund'].indexOf(d.assetClass||'ETF')>=0)?'':'display:none'}">
             <div class="nx-modal-field"><label>Region</label>
               <select id="nm-region">
                 <option value="BR" ${(d.region||'BR')==='BR'?'selected':''}>Domestic (BR)</option>
@@ -2351,7 +2352,7 @@ select.form-input { cursor: pointer; }
         const fiFields = _container.querySelector('#nm-fi-fields');
         if (fiFields) fiFields.style.display = isFixedIncome(nmClass.value) ? '' : 'none';
         const regionFields = _container.querySelector('#nm-region-fields');
-        if (regionFields) regionFields.style.display = (['ETF','Fund'].indexOf(nmClass.value) >= 0) ? '' : 'none';
+        if (regionFields) regionFields.style.display = (['ETF','Stock','Fund'].indexOf(nmClass.value) >= 0) ? '' : 'none';
       });
     }
 
