@@ -2584,18 +2584,65 @@ select.form-input { cursor: pointer; }
     _mounted = false;
   }
 
-  let _lastActive = false;
-  new MutationObserver(() => {
-    const now = isInvestmentTransactions();
-    if (now === _lastActive) return;
-    _lastActive = now;
-    now ? mount() : unmount();
-  }).observe(document.body, { subtree: true, attributes: true, attributeFilter: ['class'] });
+  // Reconciliação baseada no estado real do DOM (não em detecção de borda).
+  // Corrige o bug em que voltar de "New Investments" deixava o layout antigo:
+  // sempre que estivermos na página, garante que o layout novo está montado e
+  // que as views originais do React continuam escondidas (mesmo que outro
+  // script as tenha reexibido ao desmontar).
+  function ensureHidden() {
+    const main = document.querySelector('.main');
+    if (!main) return;
+    Array.from(main.children).forEach(el => {
+      if (el === _container) return;
+      if (el.style.display !== 'none') { el.dataset.nxHidden = '1'; el.style.display = 'none'; }
+    });
+  }
 
-  setTimeout(() => {
-    _lastActive = isInvestmentTransactions();
-    if (_lastActive) mount();
-  }, 600);
+  function navLabelOf(btn) {
+    let l = '';
+    btn.childNodes.forEach(n => { if (n.nodeType === 3) l += n.textContent.trim(); });
+    return l;
+  }
+  function isITLabel(s) { return /investment.*trans|trans.*invest/i.test(s); }
+
+  // Alvo definido pelo ÚLTIMO clique do usuário numa aba. É a fonte de verdade
+  // mais confiável: ao voltar de "New Investments", o React acha que a aba de
+  // Transactions nunca saiu de ativa, então clicar nela é um no-op (não
+  // re-renderiza nem reaplica a classe .active). Detecção por classe falharia
+  // nesse caso — por isso usamos a intenção explícita do clique.
+  let _clickTarget = null; // true = Investments Transactions · false = outra · null = desconhecido
+
+  function reconcile() {
+    const active = (_clickTarget !== null) ? _clickTarget : isInvestmentTransactions();
+    if (active) {
+      if (!_mounted) mount();
+      else ensureHidden();
+    } else if (_mounted) {
+      unmount();
+    }
+  }
+
+  // Observa mudanças de classe (ativação de aba) e o "tick" do script de
+  // New Investments, para reagir também a navegações indiretas/programáticas.
+  new MutationObserver(reconcile).observe(document.body, {
+    subtree: true, attributes: true, attributeFilter: ['class', 'data-nx-ni-tick']
+  });
+
+  // Clique numa aba da sidebar → fixa a intenção e reavalia algumas vezes,
+  // dando tempo de outros scripts (New Investments) desmontarem e do React
+  // commitar qualquer render. O 400ms re-esconde a view antiga caso ela tenha
+  // sido reexibida pelo unmount de outro script.
+  document.addEventListener('click', function (e) {
+    const nav = e.target && e.target.closest && e.target.closest('.sidebar button.nav-item');
+    if (!nav) return;
+    _clickTarget = isITLabel(navLabelOf(nav));
+    setTimeout(reconcile, 0);
+    setTimeout(reconcile, 150);
+    setTimeout(reconcile, 400);
+  }, true);
+
+  setTimeout(reconcile, 600);
+  setTimeout(reconcile, 1500);
 
 })();
 </script>
