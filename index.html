@@ -4714,7 +4714,517 @@ select.form-input { cursor: pointer; }
   boot();
 })();
   </script>
+  <script>
+  (function () {
+    'use strict';
 
+    var ASSETS_KEY = 'nexo_investment_assets';
+    var TXS_KEY    = 'nexo_investment_transactions';
+    var VIEW_KEY   = 'nexo:cpx:assetView';
+    var FIXED_INCOME = { CDB: 1, LCI: 1, LCA: 1, Fund: 1 };
+
+    // ── data helpers ──────────────────────────────────────────────────────────
+    function getAssets() { try { return JSON.parse(localStorage.getItem(ASSETS_KEY) || '[]'); } catch (e) { return []; } }
+    function getTxs()    { try { return JSON.parse(localStorage.getItem(TXS_KEY)    || '[]'); } catch (e) { return []; } }
+    function isFI(cls)   { return !!FIXED_INCOME[cls]; }
+    function uid() { return 'cpx-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8); }
+
+    function persist(assets, txs) {
+      localStorage.setItem(ASSETS_KEY, JSON.stringify(assets));
+      localStorage.setItem(TXS_KEY, JSON.stringify(txs));
+      syncToGist(assets, txs);
+    }
+
+    // Mirrors Nexo's own Gist sync so closing a position propagates across devices.
+    function syncToGist(assets, txs) {
+      try {
+        fetch('/api/sync/data').then(function (resp) {
+          if (!resp.ok) return;
+          return resp.json();
+        }).then(function (json) {
+          if (!json || !json.payload) return;
+          var payload = json.payload;
+          if (!payload.data) payload.data = {};
+          payload.data.investmentAssets = assets;
+          payload.data.investmentTransactions = txs;
+          if (!payload.meta) payload.meta = {};
+          payload.meta.updatedAt = new Date().toISOString();
+          return fetch('/api/sync/data', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+        }).catch(function () {});
+      } catch (e) {}
+    }
+
+    // ── math helpers ────────────────────────────────────────────────────────────
+    function calcQty(txs) {
+      return txs.filter(function (t) { return t.type === 'buy' || t.type === 'sell'; })
+        .reduce(function (s, t) {
+          var q = parseFloat(t.quantity) || 0;
+          return t.type === 'buy' ? s + q : s - q;
+        }, 0);
+    }
+
+    // Cost basis spent so far (buys only).
+    function calcCost(asset, txs) {
+      var fi = isFI(asset.assetClass);
+      return txs.filter(function (t) { return t.type === 'buy'; }).reduce(function (s, t) {
+        var amt = parseFloat(t.amount) || 0;
+        var q = parseFloat(t.quantity) || 0;
+        return s + (fi ? amt : amt * q);
+      }, 0);
+    }
+
+    // Proceeds from every sell recorded.
+    function calcProceeds(asset, txs) {
+      var fi = isFI(asset.assetClass);
+      return txs.filter(function (t) { return t.type === 'sell'; }).reduce(function (s, t) {
+        var amt = parseFloat(t.amount) || 0;
+        var q = parseFloat(t.quantity) || 0;
+        return s + (fi ? amt : amt * q);
+      }, 0);
+    }
+
+    function calcIncome(txs) {
+      return txs.filter(function (t) { return t.type === 'income'; })
+        .reduce(function (s, t) { return s + (parseFloat(t.amount) || 0); }, 0);
+    }
+
+    // Realized P/L of a (fully) closed asset = proceeds + income − cost.
+    function calcRealized(asset, txs) {
+      var proceeds = calcProceeds(asset, txs);
+      var cost = calcCost(asset, txs);
+      var income = calcIncome(txs);
+      return { proceeds: proceeds, cost: cost, income: income, realized: proceeds + income - cost };
+    }
+
+    // Current estimated value of an open position (used to pre-fill the sale value).
+    function calcPosition(asset, txs) {
+      var price = parseFloat(asset.manualUnitPrice) || 0;
+      if (isFI(asset.assetClass)) return price;
+      return price * calcQty(txs);
+    }
+
+    // ── formatting ──────────────────────────────────────────────────────────────
+    function fmtBR(n, d) {
+      var dd = (d == null) ? 2 : d;
+      return (Number(n) || 0).toLocaleString('pt-BR', { minimumFractionDigits: dd, maximumFractionDigits: dd });
+    }
+    function fmtQty(n) {
+      n = Number(n) || 0;
+      if (Number.isInteger(n)) return String(n);
+      return n.toLocaleString('pt-BR', { minimumFractionDigits: 0, maximumFractionDigits: 8 });
+    }
+    function fmtDate(str) {
+      if (!str) return '—';
+      var p = String(str).slice(0, 10).split('-');
+      return p.length === 3 ? p[2] + '/' + p[1] + '/' + p[0] : str;
+    }
+    function esc(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    }
+    function today() { return new Date().toISOString().slice(0, 10); }
+
+    // ── view state ────────────────────────────────────────────────────────────────
+    function getView() { return localStorage.getItem(VIEW_KEY) === 'closed' ? 'closed' : 'active'; }
+    function setView(v) { localStorage.setItem(VIEW_KEY, v === 'closed' ? 'closed' : 'active'); }
+
+    // ── styling (scoped, complements Nexo's own classes) ──────────────────────────
+    function injectCSS() {
+      if (document.getElementById('cpx-styles')) return;
+      var css =
+        '.cpx-toggle{display:flex;gap:4px;background:var(--bg-subtle,#f0f0f0);border-radius:8px;padding:3px;margin-left:10px;}' +
+        '.cpx-v{background:none;border:none;cursor:pointer;padding:5px 12px;border-radius:5px;font-size:12px;font-weight:500;color:var(--text-secondary,#6b6b6b);font-family:inherit;}' +
+        '.cpx-v.active{background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.12);color:var(--text-primary,#1a1a1a);}' +
+        '.cpx-closed-badge{display:inline-block;margin-left:6px;padding:1px 7px;border-radius:6px;font-size:10px;font-weight:600;background:#7A756F22;color:#7A756F;vertical-align:middle;text-transform:uppercase;letter-spacing:.03em;}' +
+        '.cpx-empty{text-align:center;padding:34px 24px;color:var(--text-secondary,#7A756F);font-size:14px;}' +
+        '.cpx-overlay{position:fixed;inset:0;z-index:2147483600;background:rgba(17,24,39,.45);display:flex;align-items:center;justify-content:center;padding:20px;font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif;}' +
+        '.cpx-modal{background:#fff;border-radius:16px;max-width:440px;width:100%;padding:24px;box-shadow:0 20px 60px rgba(0,0,0,.3);color:#1f2937;max-height:92vh;overflow:auto;}' +
+        '.cpx-modal h3{font-family:"Fraunces",Georgia,serif;font-size:20px;font-weight:600;margin:0 0 4px;color:var(--text,#2D2A26);}' +
+        '.cpx-modal .cpx-sub{font-size:13px;color:var(--text-secondary,#6b6b6b);margin:0 0 16px;line-height:1.45;}' +
+        '.cpx-field{margin-bottom:14px;}' +
+        '.cpx-field label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary,#6b7280);margin-bottom:5px;}' +
+        '.cpx-field input,.cpx-field textarea{width:100%;box-sizing:border-box;border:1.5px solid var(--border,#e8e8e8);border-radius:8px;padding:10px;font-size:14px;font-family:inherit;background:var(--input-bg,#fafafa);color:var(--text,#1a1a1a);}' +
+        '.cpx-money{display:flex;align-items:center;gap:6px;border:1.5px solid var(--border,#e8e8e8);border-radius:8px;padding:0 10px;background:var(--input-bg,#fafafa);}' +
+        '.cpx-money span{font-size:13px;color:var(--text-secondary,#6b7280);}' +
+        '.cpx-money input{border:none;background:transparent;outline:none;font-size:14px;width:100%;padding:10px 0;color:var(--text,#1a1a1a);}' +
+        '.cpx-info{font-size:13px;color:var(--text-secondary,#6b6b6b);margin-bottom:12px;}' +
+        '.cpx-preview{display:flex;justify-content:space-between;align-items:center;padding:12px 14px;background:#FAF7F3;border:1px solid var(--border,#EDE8E3);border-radius:10px;margin:4px 0 14px;}' +
+        '.cpx-preview .lbl{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--text-secondary,#7A756F);}' +
+        '.cpx-preview .val{font-family:"Fraunces",Georgia,serif;font-size:18px;font-weight:600;font-variant-numeric:tabular-nums;}' +
+        '.cpx-pos{color:#3F6F50;}.cpx-neg{color:#C25450;}' +
+        '.cpx-err{display:none;color:#C25450;font-size:13px;margin-bottom:10px;}' +
+        '.cpx-foot{display:flex;justify-content:flex-end;gap:10px;margin-top:6px;}' +
+        '.cpx-btn{cursor:pointer;border-radius:8px;padding:9px 16px;font-size:13px;font-weight:600;font-family:inherit;border:1px solid transparent;}' +
+        '.cpx-btn-ghost{background:transparent;border-color:var(--border,#e8e8e8);color:var(--text-secondary,#6b6b6b);}' +
+        '.cpx-btn-primary{background:var(--accent,#E07A5F);color:#fff;}' +
+        '.cpx-btn-danger{background:#C25450;color:#fff;}';
+      var st = document.createElement('style');
+      st.id = 'cpx-styles';
+      st.textContent = css;
+      document.head.appendChild(st);
+    }
+
+    // ── locate the Assets section inside Nexo's Investments Transactions page ─────
+    function findAssetsSection() {
+      var root = document.getElementById('nx-it-root');
+      if (!root) return null;
+      var titles = root.querySelectorAll('.nx-section .nx-section-title');
+      for (var i = 0; i < titles.length; i++) {
+        if ((titles[i].textContent || '').trim() === 'Assets') {
+          return titles[i].closest('.nx-section');
+        }
+      }
+      return null;
+    }
+
+    // ── re-entrancy guard so our DOM writes don't loop the MutationObserver ───────
+    var busy = false;
+
+    function updateUI() {
+      var section = findAssetsSection();
+      if (!section) return;
+      busy = true;
+      try {
+        var header = section.querySelector('.nx-section-header');
+        var grid = section.querySelector('.nx-asset-grid');
+        var pill = section.querySelector('.nx-pill');
+        var assets = getAssets();
+        var txs = getTxs();
+        var view = getView();
+
+        var byId = {};
+        assets.forEach(function (a) { byId[a.id] = a; });
+        var closedAssets = assets.filter(function (a) { return a.closed; });
+        var activeAssets = assets.filter(function (a) { return !a.closed; });
+
+        // 1 · toggle in the header
+        ensureToggle(header, view);
+
+        // 2 · remove our previous injections (we rebuild each pass)
+        var oldClosed = section.querySelector('.cpx-closed-grid');
+        if (oldClosed) oldClosed.remove();
+        var oldEmpty = section.querySelector('.cpx-empty');
+        if (oldEmpty) oldEmpty.remove();
+
+        if (!grid) { busy = false; return; }
+
+        if (view === 'active') {
+          grid.style.display = '';
+          // show active cards, hide closed ones, add the Close button
+          var anyActive = false;
+          Array.prototype.forEach.call(grid.querySelectorAll('.nx-asset-card'), function (card) {
+            var id = card.getAttribute('data-asset-id');
+            var asset = byId[id];
+            if (asset && asset.closed) { card.style.display = 'none'; return; }
+            card.style.display = '';
+            anyActive = true;
+            addCloseButton(card, id);
+          });
+          // pill: active count + total value
+          var totalActive = activeAssets.reduce(function (s, a) {
+            return s + calcPosition(a, txs.filter(function (t) { return t.assetId === a.id; }));
+          }, 0);
+          if (pill) pill.textContent = activeAssets.length + ' asset' + (activeAssets.length !== 1 ? 's' : '') + ' · R$ ' + fmtBR(totalActive);
+          if (!anyActive) {
+            var e = document.createElement('div');
+            e.className = 'cpx-empty';
+            e.textContent = closedAssets.length
+              ? 'No open positions. Your closed positions are under the "Closed" tab.'
+              : 'No open positions yet.';
+            grid.parentNode.insertBefore(e, grid.nextSibling);
+          }
+        } else {
+          // closed view — hide the original grid, render closed cards ourselves
+          grid.style.display = 'none';
+          var totalRealized = 0;
+          var cardsHtml = closedAssets.map(function (a) {
+            var t = txs.filter(function (x) { return x.assetId === a.id; });
+            var r = calcRealized(a, t);
+            totalRealized += r.realized;
+            return closedCardHTML(a, t, r);
+          }).join('');
+          if (closedAssets.length) {
+            var cg = document.createElement('div');
+            cg.className = 'nx-asset-grid cpx-closed-grid';
+            cg.innerHTML = cardsHtml;
+            grid.parentNode.insertBefore(cg, grid.nextSibling);
+          } else {
+            var e2 = document.createElement('div');
+            e2.className = 'cpx-empty';
+            e2.textContent = 'No closed positions yet. Use "Close position" on an asset to record a full sale.';
+            grid.parentNode.insertBefore(e2, grid.nextSibling);
+          }
+          var sign = totalRealized >= 0 ? '+' : '−';
+          if (pill) pill.textContent = closedAssets.length + ' closed · ' + sign + 'R$ ' + fmtBR(Math.abs(totalRealized)) + ' realized';
+        }
+      } catch (e) { /* swallow — never break Nexo */ }
+      busy = false;
+    }
+
+    function ensureToggle(header, view) {
+      if (!header) return;
+      var t = header.querySelector('.cpx-toggle');
+      if (!t) {
+        t = document.createElement('div');
+        t.className = 'cpx-toggle';
+        t.innerHTML =
+          '<button class="cpx-v" data-cpx="view" data-v="active">Active</button>' +
+          '<button class="cpx-v" data-cpx="view" data-v="closed">Closed</button>';
+        var collapse = header.querySelector('.nx-collapse-btn');
+        if (collapse) header.insertBefore(t, collapse);
+        else header.appendChild(t);
+      }
+      Array.prototype.forEach.call(t.querySelectorAll('.cpx-v'), function (b) {
+        if (b.getAttribute('data-v') === view) b.classList.add('active');
+        else b.classList.remove('active');
+      });
+    }
+
+    function addCloseButton(card, id) {
+      var actions = card.querySelector('.nx-asset-actions');
+      if (!actions) return;
+      if (actions.querySelector('.cpx-close-btn')) return;
+      var b = document.createElement('button');
+      b.className = 'nx-btn nx-btn-outline nx-btn-sm cpx-close-btn';
+      b.setAttribute('data-cpx', 'open-close');
+      b.setAttribute('data-id', id);
+      b.textContent = '⊘ Close position';
+      actions.appendChild(b);
+    }
+
+    function closedCardHTML(asset, txs, r) {
+      var plCls = r.realized >= 0 ? 'cpx-pos' : 'cpx-neg';
+      var plSign = r.realized >= 0 ? '+' : '−';
+      var pct = r.cost ? (r.realized / r.cost * 100) : 0;
+      var meta = (asset.ticker ? esc(asset.ticker) : '') + (asset.closedAt ? (asset.ticker ? ' · ' : '') + 'closed ' + fmtDate(asset.closedAt) : '');
+      return '' +
+        '<div class="nx-asset-card" data-asset-id="' + esc(asset.id) + '" style="opacity:.96;">' +
+          '<div class="nx-asset-card-header">' +
+            '<div>' +
+              '<div class="nx-asset-card-name">' + esc(asset.name) +
+                '<span class="nx-asset-class-badge">' + esc(asset.assetClass || '') + '</span>' +
+                '<span class="cpx-closed-badge">Closed</span>' +
+              '</div>' +
+              '<div class="nx-asset-card-meta">' + meta + '</div>' +
+            '</div>' +
+            '<div class="nx-asset-actions">' +
+              '<button class="nx-btn nx-btn-outline nx-btn-sm" data-cpx="reopen" data-id="' + esc(asset.id) + '">↺ Reopen</button>' +
+            '</div>' +
+          '</div>' +
+          '<div class="nx-stats-grid">' +
+            '<div class="nx-stat"><div class="nx-stat-label">Total invested</div><div class="nx-stat-value">R$ ' + fmtBR(r.cost) + '</div></div>' +
+            '<div class="nx-stat"><div class="nx-stat-label">Total received</div><div class="nx-stat-value">R$ ' + fmtBR(r.proceeds) + '</div>' +
+              (r.income > 0 ? '<div class="nx-stat-sub">incl. R$ ' + fmtBR(r.income) + ' income</div>' : '') + '</div>' +
+            '<div class="nx-stat"><div class="nx-stat-label">Realized P/L</div>' +
+              '<div class="nx-stat-value ' + plCls + '">' + plSign + 'R$ ' + fmtBR(Math.abs(r.realized)) + '</div>' +
+              '<div class="nx-stat-sub ' + plCls + '">' + plSign + fmtBR(Math.abs(pct), 1) + '%</div></div>' +
+          '</div>' +
+          '<div class="nx-asset-footer">' +
+            '<span class="nx-asset-footer-left">History kept · ' + txs.length + ' transaction' + (txs.length !== 1 ? 's' : '') + '</span>' +
+            '<span class="nx-asset-footer-right">Removed from active wallet</span>' +
+          '</div>' +
+        '</div>';
+    }
+
+    // ── close-position modal ────────────────────────────────────────────────────
+    function openModal(assetId) {
+      var assets = getAssets();
+      var asset = assets.filter(function (a) { return a.id === assetId; })[0];
+      if (!asset) return;
+      var txs = getTxs().filter(function (t) { return t.assetId === assetId; });
+      var fi = isFI(asset.assetClass);
+      var qty = calcQty(txs);
+      var cost = calcCost(asset, txs);
+      var income = calcIncome(txs);
+      var priorProceeds = calcProceeds(asset, txs);
+      var base = priorProceeds + income - cost;       // realized result BEFORE this sale
+      var suggested = calcPosition(asset, txs);         // pre-fill with current est. value
+      var realizedNow = base + suggested;
+
+      var posInfo = fi
+        ? 'Net invested: <strong>R$ ' + fmtBR(cost - priorProceeds) + '</strong> · cost basis R$ ' + fmtBR(cost)
+        : 'Current position: <strong>' + fmtQty(qty) + '</strong> shares · cost basis R$ ' + fmtBR(cost);
+      var warn = (!fi && qty <= 0)
+        ? '<div class="cpx-err" style="display:block;">This asset has no open shares to close.</div>' : '';
+
+      var ov = document.createElement('div');
+      ov.className = 'cpx-overlay';
+      ov.setAttribute('data-cpx', 'overlay');
+      ov.innerHTML =
+        '<div class="cpx-modal" role="dialog" aria-modal="true">' +
+          '<h3>Close position — ' + esc(asset.name) + '</h3>' +
+          '<p class="cpx-sub">Records the full sale, removes the asset from the active wallet and keeps its history so the realized profit/loss stays available.</p>' +
+          '<div class="cpx-info">' + posInfo + '</div>' +
+          warn +
+          '<div class="cpx-field"><label>Sale date *</label><input type="date" id="cpx-date" value="' + esc(today()) + '"></div>' +
+          '<div class="cpx-field"><label>Total amount received (R$) *</label>' +
+            '<div class="cpx-money"><span>R$</span>' +
+              '<input type="text" id="cpx-value" inputmode="decimal" autocomplete="off" data-base="' + base + '" value="' + fmtBR(suggested) + '" placeholder="0,00">' +
+            '</div></div>' +
+          '<div class="cpx-field"><label>Note</label><textarea id="cpx-note" rows="2" placeholder="Optional…"></textarea></div>' +
+          '<div class="cpx-preview"><span class="lbl">Realized P/L</span>' +
+            '<span class="val ' + (realizedNow >= 0 ? 'cpx-pos' : 'cpx-neg') + '" id="cpx-realized">' +
+            (realizedNow >= 0 ? '+' : '−') + 'R$ ' + fmtBR(Math.abs(realizedNow)) + '</span></div>' +
+          '<div class="cpx-err" id="cpx-error"></div>' +
+          '<div class="cpx-foot">' +
+            '<button class="cpx-btn cpx-btn-ghost" data-cpx="cancel">Cancel</button>' +
+            '<button class="cpx-btn cpx-btn-primary" data-cpx="confirm" data-id="' + esc(asset.id) + '">Close position</button>' +
+          '</div>' +
+        '</div>';
+      document.body.appendChild(ov);
+
+      var input = ov.querySelector('#cpx-value');
+      function recompute() {
+        var digits = input.value.replace(/\D/g, '');
+        var cents = parseInt(digits || '0', 10);
+        var fmt = (cents / 100).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        input.value = fmt;
+        try { input.setSelectionRange(fmt.length, fmt.length); } catch (e) {}
+        var prev = ov.querySelector('#cpx-realized');
+        var b = parseFloat(input.getAttribute('data-base')) || 0;
+        var rl = b + cents / 100;
+        prev.textContent = (rl >= 0 ? '+' : '−') + 'R$ ' + fmtBR(Math.abs(rl));
+        prev.className = 'val ' + (rl >= 0 ? 'cpx-pos' : 'cpx-neg');
+        var err = ov.querySelector('#cpx-error');
+        if (err) err.style.display = 'none';
+      }
+      input.addEventListener('input', recompute);
+      input.addEventListener('focus', function () { input.select(); });
+      setTimeout(function () { input.focus(); input.select(); }, 30);
+    }
+
+    function closeModal() {
+      var ov = document.querySelector('.cpx-overlay');
+      if (ov) ov.remove();
+    }
+
+    function confirmClose(assetId) {
+      var ov = document.querySelector('.cpx-overlay');
+      if (!ov) return;
+      var assets = getAssets();
+      var idx = -1;
+      for (var i = 0; i < assets.length; i++) { if (assets[i].id === assetId) { idx = i; break; } }
+      if (idx < 0) return;
+      var asset = assets[idx];
+      var fi = isFI(asset.assetClass);
+      var txs = getTxs();
+      var mine = txs.filter(function (t) { return t.assetId === assetId; });
+      var qty = calcQty(mine);
+
+      var valEl = ov.querySelector('#cpx-value');
+      var dateEl = ov.querySelector('#cpx-date');
+      var noteEl = ov.querySelector('#cpx-note');
+      var errEl = ov.querySelector('#cpx-error');
+      var digits = (valEl.value || '').replace(/\D/g, '');
+      var saleValue = parseInt(digits || '0', 10) / 100;
+      var date = (dateEl && dateEl.value) || today();
+      var note = (noteEl && noteEl.value) || '';
+
+      function fail(msg) { if (errEl) { errEl.textContent = msg; errEl.style.display = 'block'; } }
+      if (isNaN(saleValue) || saleValue < 0) { return fail('Enter a valid sale amount.'); }
+      if (!fi && qty <= 0) { return fail('This asset has no open shares to close.'); }
+
+      var closingTx = {
+        id: uid(),
+        assetId: assetId,
+        type: 'sell',
+        date: date,
+        quantity: fi ? 1 : qty,
+        amount: fi ? saleValue : (qty > 0 ? saleValue / qty : 0),
+        notes: note || 'Position closed (full sale)',
+        closing: true
+      };
+      txs.push(closingTx);
+
+      asset.closed = true;
+      asset.closedAt = date;
+      asset.closeProceeds = saleValue;
+      asset.closeTxId = closingTx.id;
+      asset.manualUnitPrice = 0;            // zeroes current value → drops out of active wallet & dashboard
+      asset.priceUpdatedAt = new Date().toISOString();
+      assets[idx] = asset;
+
+      persist(assets, txs);
+      closeModal();
+      setView('closed');                    // jump to the Closed tab so the result is visible
+      forceRerender();
+      updateUI();
+    }
+
+    function reopen(assetId) {
+      var assets = getAssets();
+      var idx = -1;
+      for (var i = 0; i < assets.length; i++) { if (assets[i].id === assetId) { idx = i; break; } }
+      if (idx < 0) return;
+      var asset = assets[idx];
+      var txs = getTxs();
+      if (asset.closeTxId) {
+        txs = txs.filter(function (t) { return t.id !== asset.closeTxId; });
+      }
+      delete asset.closed;
+      delete asset.closedAt;
+      delete asset.closeProceeds;
+      delete asset.closeTxId;
+      assets[idx] = asset;
+      persist(assets, txs);
+      forceRerender();
+      updateUI();
+    }
+
+    // Ask Nexo's own module to re-render (recomputes totals / allocation from fresh data).
+    function forceRerender() {
+      var btn = document.querySelector('#nx-it-root [data-action="toggle-assets"]');
+      if (btn) { btn.click(); btn.click(); }   // even number of toggles → collapse state preserved
+    }
+
+    // ── events ────────────────────────────────────────────────────────────────────
+    document.addEventListener('click', function (e) {
+      var el = e.target.closest ? e.target.closest('[data-cpx]') : null;
+      if (!el) return;
+      var act = el.getAttribute('data-cpx');
+      if (act === 'view') {
+        setView(el.getAttribute('data-v'));
+        updateUI();
+        e.preventDefault(); e.stopPropagation();
+      } else if (act === 'open-close') {
+        openModal(el.getAttribute('data-id'));
+        e.preventDefault(); e.stopPropagation();
+      } else if (act === 'reopen') {
+        reopen(el.getAttribute('data-id'));
+        e.preventDefault(); e.stopPropagation();
+      } else if (act === 'confirm') {
+        confirmClose(el.getAttribute('data-id'));
+        e.preventDefault(); e.stopPropagation();
+      } else if (act === 'cancel') {
+        closeModal();
+        e.preventDefault(); e.stopPropagation();
+      } else if (act === 'overlay') {
+        if (e.target === el) { closeModal(); e.preventDefault(); e.stopPropagation(); }
+      }
+    }, true);
+
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && document.querySelector('.cpx-overlay')) closeModal();
+    });
+
+    // ── keep our UI in sync as Nexo re-renders ──────────────────────────────────────
+    injectCSS();
+    var debounce = null;
+    new MutationObserver(function () {
+      if (busy) return;
+      clearTimeout(debounce);
+      debounce = setTimeout(updateUI, 60);
+    }).observe(document.body, { childList: true, subtree: true });
+
+    // first pass (in case the page is already mounted)
+    setTimeout(updateUI, 300);
+  })();
+  </script>
   </body>
 </html>
 
