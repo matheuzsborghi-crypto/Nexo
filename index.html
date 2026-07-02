@@ -800,10 +800,9 @@ select.form-input { cursor: pointer; }
     dashboard: SVG('<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>'),
     expenses: SVG('<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/>'),
     income: SVG('<path d="M12 3v18"/><path d="M17 8a4 4 0 0 0-4-3H11a4 4 0 0 0 0 8h2a4 4 0 1 1 0 8H11a4 4 0 0 1-4-3"/>'),
-    investments_dashboard: SVG('<path d="M3 17l6-6 4 4 7-7"/><path d="M14 8h6v6"/>'),
-    // ícone das transações: o do patch 3.13 (documento com gráfico)
-    investments_transactions: SVG('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><polyline points="8 17 10 14 13 16 16 12"/>'),
-    assets: SVG('<rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>'),
+    investments_dashboard: SVG('<path d="M12 15l3.5-3.5"/><path d="M20.3 18a10 10 0 1 0-16.6 0"/>'),
+    investments_transactions: SVG('<path d="M7 4v16"/><path d="M3 8l4-4 4 4"/><path d="M17 20V4"/><path d="M21 16l-4 4-4-4"/>'),
+    assets: SVG('<path d="M21 7H5a2 2 0 0 1-2-2 2 2 0 0 1 2-2h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16V7"/><path d="M16 13h2"/>'),
     new_investments: SVG('<circle cx="12" cy="12" r="9"/><line x1="12" y1="7" x2="12" y2="17"/><line x1="7" y1="12" x2="17" y2="12"/>'),
     compound_interest: SVG('<rect x="5" y="2" width="14" height="20" rx="2"/><line x1="8" y1="6" x2="16" y2="6"/><line x1="8" y1="11" x2="10" y2="11"/><line x1="12" y1="11" x2="14" y2="11"/><line x1="16" y1="11" x2="16" y2="11"/><line x1="8" y1="15" x2="10" y2="15"/><line x1="12" y1="15" x2="14" y2="15"/><line x1="16" y1="15" x2="16" y2="15"/><line x1="8" y1="19" x2="10" y2="19"/><line x1="12" y1="19" x2="16" y2="19"/>'),
     loans: SVG('<rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="12" cy="12" r="2.5"/><path d="M6 10h.01"/><path d="M18 14h.01"/>'),
@@ -970,8 +969,6 @@ select.form-input { cursor: pointer; }
     { value: 'investment', label: 'Investment' },
     { value: 'other', label: 'Other' },
   ];
-
-  const LAST_EXPENSE_DATE_KEY = 'nexo_last_expense_date';
 
   /* ── Helpers de data (fiéis a te/kt/hh do 3.x) ───────────────────────── */
   function te(x) {
@@ -1383,19 +1380,16 @@ select.form-input { cursor: pointer; }
       el('p', {}, text));
   }
 
-  /* ── Última data de expense (funcionalidade 3.4, agora nativa) ───────── */
+  /* ── Última data de expense (4.3): memória de SESSÃO, não persistida.
+     Ao abrir o Nexo, a sugestão é hoje; depois de cada lançamento, é a data
+     literal do último lançamento digitado (facilita vários no mesmo dia). ── */
+  let _sessionLastExpenseDate = null;
   function readLastExpenseDate() {
-    try {
-      const v = localStorage.getItem(LAST_EXPENSE_DATE_KEY);
-      if (v && /^\d{4}-\d{2}-\d{2}$/.test(v) && !isNaN(U.parseDate(v))) return v;
-    } catch (_) {}
-    return null;
+    return _sessionLastExpenseDate;
   }
   function rememberLastExpenseDate(dateStr) {
     if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr) || isNaN(U.parseDate(dateStr))) return;
-    const stored = readLastExpenseDate();
-    const best = stored && stored > dateStr ? stored : dateStr;
-    try { localStorage.setItem(LAST_EXPENSE_DATE_KEY, best); } catch (_) {}
+    _sessionLastExpenseDate = dateStr;
   }
 
   /* ── Persistência de expenses (ST do 3.x) ────────────────────────────── */
@@ -4496,6 +4490,8 @@ select.form-input { cursor: pointer; }
       outline: none; transition: border-color .15s;
     }
     .nx-filter-field input:focus, .nx-filter-field select:focus { border-color: var(--accent, #E07A5F); }
+    .nx-assets-controls { display: flex; gap: 12px; margin: 0 0 16px; max-width: 440px; }
+    .nx-assets-controls .nx-filter-field { flex: 1; }
     .nx-chips { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
     .nx-chip { display: inline-flex; align-items: center; gap: 5px; padding: 5px 12px; border-radius: 20px; font-size: 12px; font-weight: 500; cursor: pointer; border: 1.5px solid transparent; background: var(--bg-subtle, #f5f5f5); color: var(--text-secondary, #6b6b6b); transition: all .15s; user-select: none; }
     .nx-chip:hover { border-color: var(--accent, #E07A5F); }
@@ -4944,8 +4940,12 @@ select.form-input { cursor: pointer; }
     showAssets: true,
     confirmDelete: null,   // { txId }
     modal: null,           // { type: 'newAsset'|'addTx'|'editTx', data: {} }
-    closeModal: null       // { assetId, value?, date?, note? } — modal Close position (ex-cpx)
+    closeModal: null,      // { assetId, value?, date?, note? } — modal Close position (ex-cpx)
+    // Aba Assets — filtro e ordenação por classe (persistidos)
+    assetClassFilter: localStorage.getItem('nexo:assets:classFilter') || 'all',
+    assetSort: localStorage.getItem('nexo:assets:sort') || 'default'
   };
+  const ASSET_CLASSES = ['ETF', 'Stock', 'Fund', 'CDB', 'LCI', 'LCA', 'Cash'];
 
   // dirty / justSaved per asset id
   const editState = {}; // { [assetId]: { raw: string, dirty: bool, justSaved: bool } }
@@ -5119,6 +5119,39 @@ select.form-input { cursor: pointer; }
       </div>`;
   }
 
+  function sortAssetsForView(list, allTxs, view) {
+    const s = state.assetSort;
+    if (s === 'default') return list;
+    const txsOf = a => allTxs.filter(t => t.assetId === a.id);
+    const val = a => (view === 'closed')
+      ? calcRealized(a, txsOf(a)).realized
+      : calcPosition(a, calcQty(txsOf(a)));
+    const byName = (a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'pt-BR', { sensitivity: 'base' });
+    const arr = list.slice();
+    if (s === 'class') arr.sort((a, b) => String(a.assetClass || '').localeCompare(String(b.assetClass || '')) || byName(a, b));
+    else if (s === 'value') arr.sort((a, b) => val(b) - val(a));
+    else if (s === 'name') arr.sort(byName);
+    return arr;
+  }
+
+  function renderAssetsControls() {
+    const known = ASSET_CLASSES.slice();
+    getAssets().forEach(a => { if (a.assetClass && known.indexOf(a.assetClass) < 0) known.push(a.assetClass); });
+    const sorts = [['default', 'Default'], ['class', 'Class (A–Z)'], ['value', 'Value (high–low)'], ['name', 'Name (A–Z)']];
+    return `
+      <div class="nx-assets-controls">
+        <div class="nx-filter-field"><label>Class</label>
+          <select data-afilter="assetClassFilter">
+            <option value="all" ${state.assetClassFilter === 'all' ? 'selected' : ''}>All classes</option>
+            ${known.map(c => `<option value="${escHtml(c)}" ${state.assetClassFilter === c ? 'selected' : ''}>${escHtml(c)}</option>`).join('')}
+          </select></div>
+        <div class="nx-filter-field"><label>Sort by</label>
+          <select data-afilter="assetSort">
+            ${sorts.map(([v, l]) => `<option value="${v}" ${state.assetSort === v ? 'selected' : ''}>${l}</option>`).join('')}
+          </select></div>
+      </div>`;
+  }
+
   function renderAssetsSection(assets, allTxs) {
     const view = getAssetView();
 
@@ -5126,8 +5159,12 @@ select.form-input { cursor: pointer; }
     assets.forEach(a => {
       if (!a.closedAt) { const ct = closingTxFor(a, allTxs); if (ct) a.closedAt = ct.date; }
     });
-    const closedAssets = assets.filter(a => isClosedAsset(a, allTxs));
-    const activeAssets = assets.filter(a => !isClosedAsset(a, allTxs));
+    const allClosed = assets.filter(a => isClosedAsset(a, allTxs));
+    const allActive = assets.filter(a => !isClosedAsset(a, allTxs));
+    const cls = state.assetClassFilter;
+    const filterCls = list => (cls === 'all') ? list : list.filter(a => (a.assetClass || '') === cls);
+    const closedAssets = sortAssetsForView(filterCls(allClosed), allTxs, 'closed');
+    const activeAssets = sortAssetsForView(filterCls(allActive), allTxs, 'active');
 
     // Pill calculado com o conjunto certo desde o primeiro paint (sem flick).
     let pill;
@@ -5150,14 +5187,19 @@ select.form-input { cursor: pointer; }
         if (!assets.length) {
           body = `<div class="nx-empty"><div class="nx-empty-icon">📊</div><h3>No assets yet</h3><p>Add your first investment asset to start tracking.</p><button class="nx-btn nx-btn-primary" data-action="open-new-asset">+ New asset</button></div>`;
         } else if (!activeAssets.length) {
-          body = `<div class="cpx-empty">${closedAssets.length ? 'No open positions. Your closed positions are under the "Closed" tab.' : 'No open positions yet.'}</div>`;
+          body = cls !== 'all'
+            ? `<div class="cpx-empty">No open ${escHtml(cls)} positions.</div>`
+            : `<div class="cpx-empty">${allClosed.length ? 'No open positions. Your closed positions are under the "Closed" tab.' : 'No open positions yet.'}</div>`;
         } else {
-          const portfolioTotal = calcPortfolioTotal(activeAssets);
+          // % de alocação sempre relativo à carteira ativa COMPLETA, mesmo com filtro de classe
+          const portfolioTotal = calcPortfolioTotal(allActive);
           body = `<div class="nx-asset-grid">${activeAssets.map(a => renderAssetCard(a, allTxs.filter(t => t.assetId === a.id), portfolioTotal)).join('')}</div>`;
         }
       } else {
         if (!closedAssets.length) {
-          body = `<div class="cpx-empty">No closed positions yet. Use "Close position" on an asset to record a full sale.</div>`;
+          body = cls !== 'all' && allClosed.length
+            ? `<div class="cpx-empty">No closed ${escHtml(cls)} positions.</div>`
+            : `<div class="cpx-empty">No closed positions yet. Use "Close position" on an asset to record a full sale.</div>`;
         } else {
           body = `<div class="nx-asset-grid cpx-closed-grid">${closedAssets.map(a => {
             const txs = allTxs.filter(t => t.assetId === a.id);
@@ -5177,6 +5219,7 @@ select.form-input { cursor: pointer; }
           </div>
           <button class="nx-collapse-btn" data-action="toggle-assets">${arrow}</button>
         </div>
+        ${state.showAssets ? renderAssetsControls() : ''}
         ${body}
       </div>`;
   }
@@ -5713,6 +5756,16 @@ select.form-input { cursor: pointer; }
     // Delegated click — remove antes de adicionar para evitar acúmulo entre re-renders
     container.removeEventListener('click', handleClick);
     container.addEventListener('click', handleClick);
+
+    // Aba Assets: filtro/ordenação por classe (persistidos)
+    container.querySelectorAll('[data-afilter]').forEach(el => {
+      el.addEventListener('change', () => {
+        const k = el.dataset.afilter;
+        state[k] = el.value;
+        localStorage.setItem(k === 'assetClassFilter' ? 'nexo:assets:classFilter' : 'nexo:assets:sort', el.value);
+        renderAssetsPage();
+      });
+    });
 
     // Filter inputs (change + input)
     container.querySelectorAll('[data-filter]').forEach(el => {
